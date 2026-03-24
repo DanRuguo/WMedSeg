@@ -69,7 +69,7 @@ All the datasets can be found on Hugging Face [here](https://huggingface.co/data
 - <b>ISIC</b> [Hugging Face](https://huggingface.co/datasets/TahaKoleilat/MedCLIPSeg/blob/main/ISIC.zip)
 - <b>Kvasir-SEG</b> [Hugging Face](https://huggingface.co/datasets/TahaKoleilat/MedCLIPSeg/blob/main/Kvasir.zip)
 - <b>QaTa-COV19</b> [Hugging Face](https://huggingface.co/datasets/TahaKoleilat/MedCLIPSeg/blob/main/Covid19.zip)
-- <b>EUS</b> [Drive](https://drive.google.com/drive/folders/10VFNadH6cD6bG3fD2Yf90iDv3JIqsIlv)
+- <b>EUS</b> [Drive](https://drive.google.com/drive/folders/10GPl3r-ppDyWwWzneoSFH52yxUGX4xkw)
 - <b>BUSUC</b> [Hugging Face](https://huggingface.co/datasets/TahaKoleilat/MedCLIPSeg/blob/main/BUSUC.zip)
 - <b>BUSBRA</b> [Hugging Face](https://huggingface.co/datasets/TahaKoleilat/MedCLIPSeg/blob/main/BUSBRA.zip)
 - <b>BUID</b> [Hugging Face](https://huggingface.co/datasets/TahaKoleilat/MedCLIPSeg/blob/main/BUID.zip)
@@ -107,3 +107,17 @@ data/
 │       └── label/
 │           └── <mask_files>
 ```
+
+### Preprocessing EUS dataset
+
+* Download the [EUS Healthy](https://drive.google.com/file/d/1RjcNbui67GcmwBkdN_KBrgZv905xkNBZ/view?usp=drive_link) subset, place it in `data/EUS`, unzip, and rename the extracted content to `EUS_healthy`
+
+* Download the [EUS Cancer](https://drive.google.com/file/d/1Rhdnd0h2_qTKwzcILI-VzchBxf5Ifd_b/view?usp=drive_link) subset, place it in `data/EUS`, extract the data, and rename the extracted content to `EUS_cancer`
+
+* Run the preprocessing script:
+
+```python
+python utils/preprocess_EUS.py
+```
+
+* Delete `EUS_healthy` and `EUS_cancer`

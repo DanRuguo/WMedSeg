@@ -18,7 +18,7 @@ ogb>=1.2.6
 SimpleITK>=2.2.1
 connected-components-3d
 nibabel
-transformers==4.30.0
+transformers==4.56.0
 ftfy
 regex
 sentencepiece
