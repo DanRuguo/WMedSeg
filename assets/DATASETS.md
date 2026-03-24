@@ -116,8 +116,8 @@ data/
 
 * Run the preprocessing script:
 
-```python
-python utils/preprocess_EUS.py
-```
+    ```python
+    python utils/preprocess_EUS.py
+    ```
 
 * Delete `EUS_healthy` and `EUS_cancer`
