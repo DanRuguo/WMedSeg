@@ -110,7 +110,7 @@ data/
 
 ### Preprocessing EUS dataset
 
-* Download the [EUS Healthy](https://drive.google.com/file/d/1RjcNbui67GcmwBkdN_KBrgZv905xkNBZ/view?usp=drive_link) subset, place it in `data/EUS`, unzip, and rename the extracted content to `EUS_healthy`
+* Download the [EUS Healthy](https://drive.google.com/file/d/1RjcNbui67GcmwBkdN_KBrgZv905xkNBZ/view?usp=drive_link) subset, place it in `data/EUS`, extract the data, and rename the extracted content to `EUS_healthy`
 
 * Download the [EUS Cancer](https://drive.google.com/file/d/1Rhdnd0h2_qTKwzcILI-VzchBxf5Ifd_b/view?usp=drive_link) subset, place it in `data/EUS`, extract the data, and rename the extracted content to `EUS_cancer`
 
