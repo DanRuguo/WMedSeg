@@ -28,3 +28,8 @@ MODEL:
   LAYERS: [1,2,3,4,5,6,7,8,9,10]
   TEMPERATURE: 0.2
   DEVICE: "cuda"
+
+  DECODER:
+    TYPE: "w_pvl"
+    GLOBAL_LAYERS: [2,5,8,11]
+    LOCAL_CHANNELS: [64,128,256,512]
