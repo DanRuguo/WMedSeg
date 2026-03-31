@@ -5,6 +5,7 @@ import argparse
 import logging
 import random
 import numpy as np
+import torch.nn.functional as F
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from datasets.dataloader import DatasetSegmentation, ValGenerator
@@ -71,16 +72,20 @@ def _cfg_get(cfg, path, default=None):
     return cur
 
 
+def _round_to_multiple(x, base=16):
+    return max(base, int(round(float(x) / base) * base))
+
+
 def _forward_predictive_mean(model, images, texts, num_samples):
     seg_samples = model(image=images, text=texts, num_samples=num_samples)
     seg_samples = torch.sigmoid(seg_samples)
     return seg_samples.mean(dim=0)
 
 
-def predict_with_tta(model, images, texts, cfg, logger=None):
+def predict_with_tta(model, images, texts, cfg):
     num_samples = int(_cfg_get(cfg, "TEST.NUM_SAMPLES", 8))
     use_hflip = bool(_cfg_get(cfg, "TEST.TTA.HFLIP", True))
-    requested_scales = list(_cfg_get(cfg, "TEST.TTA.SCALES", []))
+    use_scales = list(_cfg_get(cfg, "TEST.TTA.SCALES", [0.875, 1.125]))
 
     preds = []
     base_pred = _forward_predictive_mean(model, images, texts, num_samples)
@@ -92,12 +97,17 @@ def predict_with_tta(model, images, texts, cfg, logger=None):
         flip_pred = torch.flip(flip_pred, dims=[-1])
         preds.append(flip_pred)
 
-    if requested_scales and logger is not None:
-        logger.info(
-            f"Skip TEST.TTA.SCALES={requested_scales} because this ViT image encoder uses fixed "
-            f"positional embeddings and only supports the trained input size "
-            f"({cfg.DATASET.SIZE}x{cfg.DATASET.SIZE}) without encoder changes."
-        )
+    h, w = images.shape[-2:]
+    for scale in use_scales:
+        nh = _round_to_multiple(h * float(scale), 16)
+        nw = _round_to_multiple(w * float(scale), 16)
+        scaled = F.interpolate(images, size=(nh, nw), mode="bilinear", align_corners=False)
+        scaled_pred = _forward_predictive_mean(model, scaled, texts, num_samples)
+        if scaled_pred.shape[-2:] != (h, w):
+            scaled_pred = F.interpolate(
+                scaled_pred.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=False
+            ).squeeze(1)
+        preds.append(scaled_pred)
 
     return torch.stack(preds, dim=0).mean(dim=0)
 
@@ -171,7 +181,7 @@ def main():
             images = batch["image"].to(cfg.MODEL.DEVICE)
             texts = batch["text_prompt"]
 
-            seg_logits = predict_with_tta(model, images, texts, cfg, logger=logger)
+            seg_logits = predict_with_tta(model, images, texts, cfg)
             seg_unc = -(
                 seg_logits * torch.log(seg_logits + 1e-8) +
                 (1 - seg_logits) * torch.log(1 - seg_logits + 1e-8)
