@@ -1,18 +1,16 @@
+import os
+import cv2
+import torch
 import argparse
 import logging
-import os
 import random
-
-import cv2
-import matplotlib.pyplot as plt
 import numpy as np
-import torch
-from torch.utils.data import DataLoader
 from tqdm import tqdm
-
+from torch.utils.data import DataLoader
 from datasets.dataloader import DatasetSegmentation, ValGenerator
 from trainers import *
-from utils.main_utils import load_cfg_from_cfg_file, normalize, read_text
+from utils.main_utils import load_cfg_from_cfg_file, read_text, normalize
+import matplotlib.pyplot as plt
 
 
 def set_random_seed(seed):
@@ -25,13 +23,18 @@ def set_random_seed(seed):
 
 def get_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config-file", required=True, type=str, help="Path to config file")
-    parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducibility.")
-    parser.add_argument("--prompt_design", type=str, default="original", help="Text prompt design.")
+    parser.add_argument(
+        "--config-file", required=True, type=str, help="Path to config file",
+    )
+    parser.add_argument('--seed', type=int, default=1, help="Random seed for reproducibility.")
+    parser.add_argument('--prompt_design', type=str, default="original", help="Text prompt design.")
     parser.add_argument("--data_percentage", type=int, default=100, help="Percentage of data to use.")
     parser.add_argument("--source_dataset", type=str, help="source dataset name for loading trained model.")
     parser.add_argument("--output-dir", type=str, default="", help="output directory")
-    parser.add_argument("opts", default=None, nargs=argparse.REMAINDER, help="modify config options using the command-line")
+    parser.add_argument(
+        "opts", default=None, nargs=argparse.REMAINDER,
+        help="modify config options using the command-line",
+    )
     args = parser.parse_args()
     cfg = load_cfg_from_cfg_file(args.config_file)
     cfg.merge_from_list(args.opts)
@@ -41,40 +44,62 @@ def get_arguments():
 
 def logger_config(log_path):
     logger = logging.getLogger()
-    logger.handlers = []
     logger.setLevel(level=logging.INFO)
-    handler = logging.FileHandler(log_path, encoding="UTF-8")
+    handler = logging.FileHandler(log_path, encoding='UTF-8')
     handler.setLevel(logging.INFO)
-    formatter = logging.Formatter("%(message)s")
+    formatter = logging.Formatter('%(message)s')
     handler.setFormatter(formatter)
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
+    logger.handlers = []
     logger.addHandler(handler)
     logger.addHandler(console)
     return logger
 
 
-def build_model(cfg):
-    if cfg.MODEL.CLIP_MODEL == "unimedclip":
-        return build_medclipseg_unimedclip(cfg)
-    if cfg.MODEL.CLIP_MODEL == "biomedclip":
-        return build_medclipseg_biomedclip(cfg)
-    if cfg.MODEL.CLIP_MODEL == "clip":
-        return build_medclipseg_clip(cfg)
-    if cfg.MODEL.CLIP_MODEL == "pubmedclip":
-        return build_medclipseg_pubmedclip(cfg)
-    raise NotImplementedError(cfg.MODEL.CLIP_MODEL)
+def _cfg_get(cfg, path, default=None):
+    cur = cfg
+    for key in path.split("."):
+        if cur is None:
+            return default
+        if hasattr(cur, key):
+            cur = getattr(cur, key)
+        elif isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        else:
+            return default
+    return cur
 
 
-def _tta_predict(model, images, text, num_samples, hflip=False):
-    pred = model(image=images, text=text, num_samples=num_samples)
-    pred_mean = torch.sigmoid(pred).mean(dim=0)
-    if not hflip:
-        return pred_mean
+def _forward_predictive_mean(model, images, texts, num_samples):
+    seg_samples = model(image=images, text=texts, num_samples=num_samples)
+    seg_samples = torch.sigmoid(seg_samples)
+    return seg_samples.mean(dim=0)
 
-    pred_flip = model(image=torch.flip(images, dims=[3]), text=text, num_samples=num_samples)
-    pred_flip = torch.flip(torch.sigmoid(pred_flip).mean(dim=0), dims=[2])
-    return 0.5 * (pred_mean + pred_flip)
+
+def predict_with_tta(model, images, texts, cfg, logger=None):
+    num_samples = int(_cfg_get(cfg, "TEST.NUM_SAMPLES", 8))
+    use_hflip = bool(_cfg_get(cfg, "TEST.TTA.HFLIP", True))
+    requested_scales = list(_cfg_get(cfg, "TEST.TTA.SCALES", []))
+
+    preds = []
+    base_pred = _forward_predictive_mean(model, images, texts, num_samples)
+    preds.append(base_pred)
+
+    if use_hflip:
+        flip_imgs = torch.flip(images, dims=[-1])
+        flip_pred = _forward_predictive_mean(model, flip_imgs, texts, num_samples)
+        flip_pred = torch.flip(flip_pred, dims=[-1])
+        preds.append(flip_pred)
+
+    if requested_scales and logger is not None:
+        logger.info(
+            f"Skip TEST.TTA.SCALES={requested_scales} because this ViT image encoder uses fixed "
+            f"positional embeddings and only supports the trained input size "
+            f"({cfg.DATASET.SIZE}x{cfg.DATASET.SIZE}) without encoder changes."
+        )
+
+    return torch.stack(preds, dim=0).mean(dim=0)
 
 
 def main():
@@ -86,6 +111,7 @@ def main():
     cfg.DATASET.NAME = cfg.DATASET.NAME + f"_{cfg.data_percentage}" if cfg.data_percentage != 100 else cfg.DATASET.NAME
     results_root = os.path.join(cfg.output_dir, cfg.DATASET.NAME, "seg_results", f"seed{cfg.seed}")
     os.makedirs(results_root, exist_ok=True)
+
     logger = logger_config(os.path.join(results_root, "log.txt"))
     logger.info("************")
     logger.info("** Config **")
@@ -94,51 +120,89 @@ def main():
 
     backbone_name = cfg.MODEL.BACKBONE.replace("/", "-")
     results_name = f"MedCLIPSeg_{cfg.MODEL.CLIP_MODEL}_{backbone_name}"
-    checkpoint_type = "latest" if cfg.TEST.USE_LATEST else "best_dice"
+
+    checkpoint_type = "latest" if bool(_cfg_get(cfg, "TEST.USE_LATEST", False)) else "best_dice"
+    checkpoint_dataset = cfg.source_dataset if cfg.data_percentage == 100 else cfg.DATASET.NAME
     checkpoint_path = os.path.join(
         cfg.output_dir,
-        cfg.source_dataset if cfg.data_percentage == 100 else cfg.DATASET.NAME,
+        checkpoint_dataset,
         "trained_models",
         f"seed{cfg.seed}",
-        f"{results_name}_{checkpoint_type}.pth",
+        f"{results_name}_{checkpoint_type}.pth"
     )
+    logger.info(f"Loading checkpoint: {checkpoint_path}")
 
-    model = build_model(cfg)
+    if cfg.MODEL.CLIP_MODEL == "unimedclip":
+        model = build_medclipseg_unimedclip(cfg)
+    elif cfg.MODEL.CLIP_MODEL == "biomedclip":
+        model = build_medclipseg_biomedclip(cfg)
+    elif cfg.MODEL.CLIP_MODEL == "clip":
+        model = build_medclipseg_clip(cfg)
+    elif cfg.MODEL.CLIP_MODEL == "pubmedclip":
+        model = build_medclipseg_pubmedclip(cfg)
+    else:
+        raise ValueError(f"Unknown CLIP model: {cfg.MODEL.CLIP_MODEL}")
+
     checkpoint = torch.load(checkpoint_path, map_location=cfg.MODEL.DEVICE, weights_only=False)
     model.load_state_dict(checkpoint["model"])
     model.eval().to(cfg.MODEL.DEVICE)
 
-    test_tf = ValGenerator(output_size=[cfg.DATASET.SIZE, cfg.DATASET.SIZE], task_name=cfg.DATASET.NAME, cfg=cfg)
+    test_tf = ValGenerator(output_size=[cfg.DATASET.SIZE, cfg.DATASET.SIZE], cfg=cfg)
     test_text_file = f"Test_text_{cfg.prompt_design}.xlsx"
     test_text = read_text(cfg.DATASET.TEXT_PROMPT_PATH + test_text_file)
-    test_dataset = DatasetSegmentation(cfg.DATASET.TEST_PATH, cfg.DATASET.NAME, test_text, test_tf, image_size=cfg.DATASET.SIZE)
-    test_dataloader = DataLoader(test_dataset, batch_size=int(getattr(cfg.TEST, "BATCH_SIZE", 32)), shuffle=False)
+    test_dataset = DatasetSegmentation(
+        cfg.DATASET.TEST_PATH,
+        cfg.DATASET.NAME,
+        test_text,
+        test_tf,
+        image_size=cfg.DATASET.SIZE,
+        cfg=cfg,
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=int(_cfg_get(cfg, "TEST.BATCH_SIZE", 32)),
+        shuffle=False,
+    )
 
-    use_hflip = bool(getattr(getattr(cfg.TEST, "TTA", None), "HFLIP", False))
+    threshold = float(_cfg_get(cfg, "TEST.THRESHOLD", 0.5))
+
     with torch.no_grad():
         for batch in tqdm(test_dataloader):
-            pred_mean = _tta_predict(
-                model=model,
-                images=batch["image"].to(cfg.MODEL.DEVICE),
-                text=batch["text_prompt"],
-                num_samples=cfg.TEST.NUM_SAMPLES,
-                hflip=use_hflip,
+            images = batch["image"].to(cfg.MODEL.DEVICE)
+            texts = batch["text_prompt"]
+
+            seg_logits = predict_with_tta(model, images, texts, cfg, logger=logger)
+            seg_unc = -(
+                seg_logits * torch.log(seg_logits + 1e-8) +
+                (1 - seg_logits) * torch.log(1 - seg_logits + 1e-8)
             )
-            seg_unc = -(pred_mean * torch.log(pred_mean + 1e-8) + (1 - pred_mean) * torch.log(1 - pred_mean + 1e-8))
-            mask_preds = pred_mean > 0.5
+            mask_preds = (seg_logits > threshold)
 
             dataset_names = batch["dataset_name"]
             mask_names = batch["mask_name"]
-            save_dir = os.path.join(cfg.output_dir, cfg.DATASET.NAME, "seg_results", f"seed{cfg.seed}", results_name + f"_Prompt-{cfg.prompt_design}")
-            save_unc_dir = os.path.join(cfg.output_dir, cfg.DATASET.NAME, "unc_results", f"seed{cfg.seed}", results_name + f"_Prompt-{cfg.prompt_design}")
-            os.makedirs(save_dir, exist_ok=True)
-            os.makedirs(save_unc_dir, exist_ok=True)
 
             for i in range(len(dataset_names)):
                 pred_mask = mask_preds[i].cpu().numpy().astype(np.uint8)
-                binary_pred = np.uint8(pred_mask > 0)
                 mask_name = mask_names[i]
-                cv2.imwrite(os.path.join(save_dir, mask_name), binary_pred * 255)
+
+                save_dir = os.path.join(
+                    cfg.output_dir,
+                    cfg.DATASET.NAME,
+                    "seg_results",
+                    f"seed{cfg.seed}",
+                    results_name + f"_Prompt-{cfg.prompt_design}",
+                )
+                save_unc_dir = os.path.join(
+                    cfg.output_dir,
+                    cfg.DATASET.NAME,
+                    "unc_results",
+                    f"seed{cfg.seed}",
+                    results_name + f"_Prompt-{cfg.prompt_design}",
+                )
+                os.makedirs(save_dir, exist_ok=True)
+                os.makedirs(save_unc_dir, exist_ok=True)
+
+                cv2.imwrite(os.path.join(save_dir, mask_name), pred_mask * 255)
 
                 u_map = seg_unc[i].cpu().numpy()
                 u_map = normalize(u_map)
