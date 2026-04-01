@@ -6,6 +6,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 from huggingface_hub import hf_hub_download
 
+from clip.interpolate import interpolate_positional_embedding
+
 from open_clip_lib import create_model_and_transforms, HFTokenizer, get_mean_std
 
 from .layers import PVL_Adapter
@@ -89,6 +91,8 @@ class CustomCLIP(nn.Module):
         self.output_hidden_states = output_hidden_states
         self.dtype = self.text_model.transformer.dtype
         self.im_size = cfg.DATASET.SIZE
+        self.allow_positional_interpolation = bool(getattr(cfg.MODEL, "ALLOW_POSITIONAL_INTERPOLATION", True))
+        self.supports_scaled_inference = self.allow_positional_interpolation
         self.device = cfg.MODEL.DEVICE
         self.tokenizer = HFTokenizer(
             "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract",
@@ -176,7 +180,22 @@ class CustomCLIP(nn.Module):
             ],
             dim=1,
         )
-        x_img = x_img + self.vision_model.positional_embedding.to(x_img.dtype)
+
+        pos_embed = self.vision_model.positional_embedding
+        if x_img.shape[1] != pos_embed.shape[0]:
+            if not self.allow_positional_interpolation:
+                raise ValueError(
+                    f"Fixed positional embedding length {pos_embed.shape[0]} does not match token length {x_img.shape[1]}. "
+                    f"Enable MODEL.ALLOW_POSITIONAL_INTERPOLATION to use scaled inputs."
+                )
+            pos_embed = interpolate_positional_embedding(
+                positional_embedding=pos_embed,
+                x=x_img,
+                patch_size=self.patch_size,
+                w=image.shape[-1],
+                h=image.shape[-2],
+            )
+        x_img = x_img + pos_embed.to(x_img.dtype)
         x_img = self.vision_model.ln_pre(x_img)
         x_img = x_img.permute(1, 0, 2)
 
