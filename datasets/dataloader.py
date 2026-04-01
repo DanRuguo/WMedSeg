@@ -14,6 +14,10 @@ CLIP_NORMALIZE = T.Normalize(
     mean=[0.485, 0.456, 0.406],
     std=[0.229, 0.224, 0.225],
 )
+OPENCLIP_NORMALIZE = T.Normalize(
+    mean=[0.48145466, 0.4578275, 0.40821073],
+    std=[0.26862954, 0.26130258, 0.27577711],
+)
 
 ENDO_DATASETS = {"kvasir", "colondb", "clinicdb", "cvc300", "bkai"}
 ULTRASOUND_DATASETS = {"busi", "busbra", "busuc", "buid", "udiat"}
@@ -25,7 +29,7 @@ def _cfg_get(cfg, path, default=None):
     if cfg is None:
         return default
     cur = cfg
-    for key in path.split("."):
+    for key in path.split('.'):
         if hasattr(cur, key):
             cur = getattr(cur, key)
         elif isinstance(cur, dict) and key in cur:
@@ -35,25 +39,40 @@ def _cfg_get(cfg, path, default=None):
     return cur
 
 
+def _pp_get(cfg, key, default=None):
+    return _cfg_get(cfg, f'DATASET.PREPROCESS.{key}', default)
+
+
+def _aug_get(cfg, key, default=None):
+    return _cfg_get(cfg, f'TRAIN.AUG.{key}', default)
+
+
 def _base_task_name(task_name: str) -> str:
-    return str(task_name).split("_")[0].lower()
+    return str(task_name).split('_')[0].lower()
 
 
 def infer_modality(task_name: str, cfg=None) -> str:
-    modality = _cfg_get(cfg, "DATASET.MODALITY", None)
+    modality = _cfg_get(cfg, 'DATASET.MODALITY', None)
     if modality is not None:
         return str(modality).lower()
 
     name = _base_task_name(task_name)
     if name in ENDO_DATASETS:
-        return "endo"
+        return 'endo'
     if name in ULTRASOUND_DATASETS:
-        return "ultrasound"
+        return 'ultrasound'
     if name in DERM_DATASETS:
-        return "derm"
+        return 'derm'
     if name in MRI_DATASETS:
-        return "mri"
-    return "rgb"
+        return 'mri'
+    return 'rgb'
+
+
+def get_normalize_transform(cfg=None):
+    mode = str(_pp_get(cfg, 'NORMALIZE', 'imagenet_clip')).lower()
+    if mode in {'open_clip', 'openai_clip', 'openai'}:
+        return OPENCLIP_NORMALIZE
+    return CLIP_NORMALIZE
 
 
 def to_long_tensor(pic):
@@ -139,25 +158,64 @@ def preprocess_image_by_modality(image: np.ndarray, modality: str, is_train: boo
     elif image.ndim == 3 and image.shape[2] == 1:
         image = np.repeat(image, 3, axis=2)
 
-    if modality == "ultrasound":
+    if modality == 'ultrasound':
         return image.astype(np.uint8)
 
-    if modality == "mri":
+    if modality == 'mri':
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         gray = percentile_clip(gray, 1.0, 99.0)
         return np.stack([gray, gray, gray], axis=-1)
 
-    if modality == "endo":
-        image = enhance_endo_luminance(image)
+    if modality == 'endo':
+        do_enhance = bool(_pp_get(cfg, 'ENDO_ENHANCE_TRAIN', False)) if is_train else bool(_pp_get(cfg, 'ENDO_ENHANCE_EVAL', False))
+        if do_enhance:
+            image = enhance_endo_luminance(image)
         return image.astype(np.uint8)
 
     return image.astype(np.uint8)
 
 
-def resize_image_and_mask(image: np.ndarray, mask: np.ndarray, output_size: Sequence[int]):
+def _cv2_border_type(pad_mode: str):
+    pad_mode = str(pad_mode).lower()
+    if pad_mode == 'reflect':
+        return cv2.BORDER_REFLECT_101
+    if pad_mode == 'edge':
+        return cv2.BORDER_REPLICATE
+    return cv2.BORDER_CONSTANT
+
+
+def resize_image_and_mask(
+    image: np.ndarray,
+    mask: np.ndarray,
+    output_size: Sequence[int],
+    keep_aspect_ratio: bool = False,
+    pad_mode: str = 'edge',
+):
     target_h, target_w = int(output_size[0]), int(output_size[1])
-    image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-    mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    if not keep_aspect_ratio:
+        image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        return image, mask
+
+    h, w = image.shape[:2]
+    if h == 0 or w == 0:
+        raise ValueError(f'Invalid image size: {(h, w)}')
+
+    scale = min(target_h / float(h), target_w / float(w))
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+
+    image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+    pad_top = (target_h - new_h) // 2
+    pad_bottom = target_h - new_h - pad_top
+    pad_left = (target_w - new_w) // 2
+    pad_right = target_w - new_w - pad_left
+
+    border_type = _cv2_border_type(pad_mode)
+    image = cv2.copyMakeBorder(image, pad_top, pad_bottom, pad_left, pad_right, border_type, value=0)
+    mask = cv2.copyMakeBorder(mask, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
     return image, mask
 
 
@@ -177,6 +235,44 @@ def random_resized_crop_pair(image: np.ndarray, mask: np.ndarray, scale=(0.80, 1
     return image, mask
 
 
+def random_focus_crop_pair(image: np.ndarray, mask: np.ndarray, scale=(0.75, 1.0), min_fg_keep: float = 0.90, tries: int = 10):
+    h, w = image.shape[:2]
+    fg = np.argwhere(mask > 0)
+    if fg.size == 0:
+        return random_resized_crop_pair(image, mask, scale=scale)
+
+    ys, xs = fg[:, 0], fg[:, 1]
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    fg_sum = max(1, int(mask.sum()))
+
+    for _ in range(max(1, int(tries))):
+        ratio = random.uniform(scale[0], scale[1])
+        crop_h = max(int(round(h * ratio)), (y1 - y0 + 1) + 4)
+        crop_w = max(int(round(w * ratio)), (x1 - x0 + 1) + 4)
+        crop_h = min(crop_h, h)
+        crop_w = min(crop_w, w)
+
+        min_top = max(0, y1 - crop_h + 1)
+        max_top = min(y0, h - crop_h)
+        min_left = max(0, x1 - crop_w + 1)
+        max_left = min(x0, w - crop_w)
+
+        top = min_top if max_top < min_top else random.randint(min_top, max_top)
+        left = min_left if max_left < min_left else random.randint(min_left, max_left)
+
+        crop_img = image[top:top + crop_h, left:left + crop_w]
+        crop_mask = mask[top:top + crop_h, left:left + crop_w]
+        if crop_mask.sum() < min_fg_keep * fg_sum:
+            continue
+
+        crop_img = cv2.resize(crop_img, (w, h), interpolation=cv2.INTER_LINEAR)
+        crop_mask = cv2.resize(crop_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        return crop_img, crop_mask
+
+    return image, mask
+
+
 def rotate_pair(image: np.ndarray, mask: np.ndarray, max_deg: float = 10.0):
     angle = random.uniform(-max_deg, max_deg)
     h, w = image.shape[:2]
@@ -191,48 +287,110 @@ def adjust_gamma(image: np.ndarray, gamma: float) -> np.ndarray:
     return cv2.LUT(image, table)
 
 
-def apply_endo_aug(image: np.ndarray, mask: np.ndarray):
-    if random.random() < 0.5:
+def apply_rect_dropout(image: np.ndarray, max_regions: int = 2, area_ratio=(0.01, 0.05)) -> np.ndarray:
+    h, w = image.shape[:2]
+    mean_color = tuple(int(x) for x in image.reshape(-1, image.shape[-1]).mean(axis=0))
+    num_regions = random.randint(1, max_regions)
+    for _ in range(num_regions):
+        region_area = random.uniform(area_ratio[0], area_ratio[1]) * h * w
+        rect_h = max(4, int(round(np.sqrt(region_area))))
+        rect_w = max(4, int(round(region_area / max(rect_h, 1))))
+        rect_h = min(rect_h, h)
+        rect_w = min(rect_w, w)
+        top = random.randint(0, max(0, h - rect_h))
+        left = random.randint(0, max(0, w - rect_w))
+        image[top:top + rect_h, left:left + rect_w] = mean_color
+    return image
+
+
+def apply_random_endoscopic_viewport(image: np.ndarray, mask: np.ndarray, fov_ratio=(0.84, 0.98), vignette_p: float = 0.5):
+    h, w = image.shape[:2]
+    cy = 0.5 * h + random.uniform(-0.03, 0.03) * h
+    cx = 0.5 * w + random.uniform(-0.03, 0.03) * w
+    ry = 0.5 * h * random.uniform(fov_ratio[0], fov_ratio[1])
+    rx = 0.5 * w * random.uniform(fov_ratio[0], fov_ratio[1])
+
+    yy, xx = np.ogrid[:h, :w]
+    norm = ((yy - cy) / max(ry, 1e-6)) ** 2 + ((xx - cx) / max(rx, 1e-6)) ** 2
+    valid = norm <= 1.0
+
+    out = image.copy()
+    out[~valid] = 0
+
+    if random.random() < vignette_p:
+        falloff = np.clip(1.15 - np.sqrt(np.clip(norm, 0.0, None)), 0.65, 1.0).astype(np.float32)
+        out = np.clip(out.astype(np.float32) * falloff[..., None], 0, 255).astype(np.uint8)
+
+    if mask is not None:
+        mask = mask.copy()
+        mask[~valid] = 0
+    return out, mask
+
+
+def apply_endo_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
+    if random.random() < float(_aug_get(cfg, 'HFLIP_P', 0.5)):
         image = cv2.flip(image, 1)
         mask = cv2.flip(mask, 1)
 
-    if random.random() < 0.35:
-        image, mask = rotate_pair(image, mask, 10.0)
+    if random.random() < float(_aug_get(cfg, 'ENDO_ROTATE_P', 0.20)):
+        image, mask = rotate_pair(image, mask, float(_aug_get(cfg, 'ENDO_ROTATE_DEG', 10.0)))
 
-    if random.random() < 0.40:
-        image, mask = random_resized_crop_pair(image, mask, scale=(0.80, 1.0))
+    focus_p = float(_aug_get(cfg, 'ENDO_FOCUS_CROP_P', 0.35))
+    if random.random() < focus_p:
+        scale = _aug_get(cfg, 'ENDO_FOCUS_SCALE', [0.75, 1.0])
+        image, mask = random_focus_crop_pair(
+            image,
+            mask,
+            scale=(float(scale[0]), float(scale[1])),
+            min_fg_keep=float(_aug_get(cfg, 'ENDO_MIN_FG_KEEP', 0.90)),
+        )
 
-    if random.random() < 0.50:
-        alpha = random.uniform(0.85, 1.15)
-        beta = random.uniform(-12.0, 12.0)
+    if random.random() < float(_aug_get(cfg, 'ENDO_COLOR_P', 0.35)):
+        alpha = random.uniform(0.90, 1.10)
+        beta = random.uniform(-10.0, 10.0)
         image = np.clip(image.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
 
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
-        hsv[..., 1] *= random.uniform(0.90, 1.15)
-        hsv[..., 0] += random.uniform(-4.0, 4.0)
+        hsv[..., 1] *= random.uniform(0.92, 1.12)
+        hsv[..., 0] += random.uniform(-3.0, 3.0)
         hsv[..., 0] %= 180.0
         hsv[..., 1:] = np.clip(hsv[..., 1:], 0, 255)
         image = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
-    if random.random() < 0.25:
-        image = adjust_gamma(image, random.uniform(0.90, 1.10))
+    if random.random() < float(_aug_get(cfg, 'ENDO_GAMMA_P', 0.20)):
+        image = adjust_gamma(image, random.uniform(0.92, 1.08))
 
-    if random.random() < 0.10:
+    if random.random() < float(_aug_get(cfg, 'ENDO_BLUR_P', 0.10)):
         image = cv2.GaussianBlur(image, (3, 3), 0)
 
-    if random.random() < 0.05:
-        noise = np.random.normal(0.0, 3.0, size=image.shape).astype(np.float32)
+    if random.random() < float(_aug_get(cfg, 'ENDO_NOISE_P', 0.05)):
+        noise = np.random.normal(0.0, float(_aug_get(cfg, 'ENDO_NOISE_STD', 3.0)), size=image.shape).astype(np.float32)
         image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    if random.random() < float(_aug_get(cfg, 'ENDO_OCCLUSION_P', 0.12)):
+        image = apply_rect_dropout(
+            image,
+            max_regions=int(_aug_get(cfg, 'ENDO_OCCLUSION_REGIONS', 2)),
+            area_ratio=tuple(float(x) for x in _aug_get(cfg, 'ENDO_OCCLUSION_AREA', [0.01, 0.05])),
+        )
+
+    if random.random() < float(_aug_get(cfg, 'ENDO_VIEWPORT_P', 0.20)):
+        image, mask = apply_random_endoscopic_viewport(
+            image,
+            mask,
+            fov_ratio=tuple(float(x) for x in _aug_get(cfg, 'ENDO_VIEWPORT_RATIO', [0.84, 0.98])),
+            vignette_p=float(_aug_get(cfg, 'ENDO_VIEWPORT_VIGNETTE_P', 0.50)),
+        )
 
     return image, mask
 
 
-def apply_default_aug(image: np.ndarray, mask: np.ndarray):
-    if random.random() < 0.5:
+def apply_default_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
+    if random.random() < float(_aug_get(cfg, 'HFLIP_P', 0.5)):
         image = cv2.flip(image, 1)
         mask = cv2.flip(mask, 1)
-    if random.random() < 0.25:
-        image, mask = rotate_pair(image, mask, 15.0)
+    if random.random() < float(_aug_get(cfg, 'DEFAULT_ROTATE_P', 0.25)):
+        image, mask = rotate_pair(image, mask, float(_aug_get(cfg, 'DEFAULT_ROTATE_DEG', 15.0)))
     return image, mask
 
 
@@ -243,27 +401,38 @@ class ValGenerator(object):
         self.task_name = task_name
 
     def __call__(self, sample):
-        image, mask = sample["image"], sample["ground_truth_mask"]
-        task_name = sample.get("dataset_name", self.task_name)
+        image, mask = sample['image'], sample['ground_truth_mask']
+        task_name = sample.get('dataset_name', self.task_name)
         modality = infer_modality(task_name, self.cfg)
 
         if mask.ndim == 3:
             mask = mask[..., 0]
 
-        if modality == "endo":
-            image, mask = crop_valid_fov(image, mask, gray_thr=8, min_keep_ratio=0.55)
+        if modality == 'endo' and bool(_pp_get(self.cfg, 'ENDO_CROP_VALID_FOV', False)):
+            image, mask = crop_valid_fov(
+                image,
+                mask,
+                gray_thr=int(_pp_get(self.cfg, 'ENDO_CROP_GRAY_THR', 8)),
+                min_keep_ratio=float(_pp_get(self.cfg, 'ENDO_CROP_MIN_KEEP_RATIO', 0.55)),
+            )
 
         image = preprocess_image_by_modality(image, modality, is_train=False, cfg=self.cfg)
-        image, mask = resize_image_and_mask(image, mask, self.output_size)
+        image, mask = resize_image_and_mask(
+            image,
+            mask,
+            self.output_size,
+            keep_aspect_ratio=bool(_pp_get(self.cfg, 'KEEP_ASPECT_RATIO', modality == 'endo')),
+            pad_mode=str(_pp_get(self.cfg, 'PAD_MODE', 'edge')),
+        )
 
         image = Image.fromarray(image.astype(np.uint8))
         mask = Image.fromarray(mask.astype(np.uint8))
         image = F.to_tensor(image)
-        image = CLIP_NORMALIZE(image)
+        image = get_normalize_transform(self.cfg)(image)
         mask = to_long_tensor(mask)
 
-        sample["image"] = image
-        sample["ground_truth_mask"] = mask
+        sample['image'] = image
+        sample['ground_truth_mask'] = mask
         return sample
 
 
@@ -274,32 +443,43 @@ class RandomGenerator(object):
         self.task_name = task_name
 
     def __call__(self, sample):
-        image, mask = sample["image"], sample["ground_truth_mask"]
-        task_name = sample.get("dataset_name", self.task_name)
+        image, mask = sample['image'], sample['ground_truth_mask']
+        task_name = sample.get('dataset_name', self.task_name)
         modality = infer_modality(task_name, self.cfg)
 
         if mask.ndim == 3:
             mask = mask[..., 0]
 
-        if modality == "endo":
-            image, mask = crop_valid_fov(image, mask, gray_thr=8, min_keep_ratio=0.55)
+        if modality == 'endo' and bool(_pp_get(self.cfg, 'ENDO_CROP_VALID_FOV', False)):
+            image, mask = crop_valid_fov(
+                image,
+                mask,
+                gray_thr=int(_pp_get(self.cfg, 'ENDO_CROP_GRAY_THR', 8)),
+                min_keep_ratio=float(_pp_get(self.cfg, 'ENDO_CROP_MIN_KEEP_RATIO', 0.55)),
+            )
 
         image = preprocess_image_by_modality(image, modality, is_train=True, cfg=self.cfg)
-        image, mask = resize_image_and_mask(image, mask, self.output_size)
+        image, mask = resize_image_and_mask(
+            image,
+            mask,
+            self.output_size,
+            keep_aspect_ratio=bool(_pp_get(self.cfg, 'KEEP_ASPECT_RATIO', modality == 'endo')),
+            pad_mode=str(_pp_get(self.cfg, 'PAD_MODE', 'edge')),
+        )
 
-        if modality == "endo":
-            image, mask = apply_endo_aug(image, mask)
+        if modality == 'endo':
+            image, mask = apply_endo_aug(image, mask, cfg=self.cfg)
         else:
-            image, mask = apply_default_aug(image, mask)
+            image, mask = apply_default_aug(image, mask, cfg=self.cfg)
 
         image = Image.fromarray(image.astype(np.uint8))
         mask = Image.fromarray(mask.astype(np.uint8))
         image = F.to_tensor(image)
-        image = CLIP_NORMALIZE(image)
+        image = get_normalize_transform(self.cfg)(image)
         mask = to_long_tensor(mask)
 
-        sample["image"] = image
-        sample["ground_truth_mask"] = mask
+        sample['image'] = image
+        sample['ground_truth_mask'] = mask
         return sample
 
 
@@ -316,12 +496,12 @@ class DatasetSegmentation(Dataset):
     ) -> None:
         self.dataset_path = dataset_path
         self.image_size = image_size
-        self.input_path = os.path.join(dataset_path, "img")
-        self.output_path = os.path.join(dataset_path, "label")
+        self.input_path = os.path.join(dataset_path, 'img')
+        self.output_path = os.path.join(dataset_path, 'label')
         self.one_hot_mask = one_hot_mask
         self.task_name = task_name
         self.cfg = cfg
-        self.data_pairs = [(row["Image"], row["Ground Truth"], row["Description"]) for row in row_text]
+        self.data_pairs = [(row['Image'], row['Ground Truth'], row['Description']) for row in row_text]
         self.data_pairs = sorted(self.data_pairs, key=lambda x: x[0])
         self.joint_transform = joint_transform if joint_transform is not None else (lambda x: x)
 
@@ -343,27 +523,27 @@ class DatasetSegmentation(Dataset):
         if mask is None:
             raise FileNotFoundError(mask_path)
 
-        threshold = int(_cfg_get(self.cfg, "DATASET.MASK_THRESHOLD", 127))
+        threshold = int(_cfg_get(self.cfg, 'DATASET.MASK_THRESHOLD', 127))
         mask = binarize_mask(mask, threshold=threshold)
         image, mask = correct_dims(image, mask)
 
         inputs = {
-            "image": image,
-            "ground_truth_mask": mask,
-            "image_name": image_filename,
-            "mask_name": mask_filename,
-            "text_prompt": text,
-            "dataset_name": self.task_name,
+            'image': image,
+            'ground_truth_mask': mask,
+            'image_name': image_filename,
+            'mask_name': mask_filename,
+            'text_prompt': text,
+            'dataset_name': self.task_name,
         }
         inputs = self.joint_transform(inputs)
 
         if self.one_hot_mask:
-            m = inputs["ground_truth_mask"]
+            m = inputs['ground_truth_mask']
             if isinstance(m, np.ndarray):
                 m = torch.from_numpy(m)
             if m.ndim == 2:
                 m = m.unsqueeze(0)
-            inputs["ground_truth_mask"] = torch.zeros(
+            inputs['ground_truth_mask'] = torch.zeros(
                 (self.one_hot_mask, m.shape[-2], m.shape[-1]),
                 dtype=torch.float32,
             ).scatter_(0, m.long(), 1)
