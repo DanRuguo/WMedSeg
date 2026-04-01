@@ -72,7 +72,7 @@ def _cfg_get(cfg, path, default=None):
     return cur
 
 
-def _round_to_multiple(x, base=16):
+def _round_to_multiple(x, base=32):
     return max(base, int(round(float(x) / base) * base))
 
 
@@ -86,6 +86,16 @@ def predict_with_tta(model, images, texts, cfg):
     num_samples = int(_cfg_get(cfg, "TEST.NUM_SAMPLES", 8))
     use_hflip = bool(_cfg_get(cfg, "TEST.TTA.HFLIP", True))
     use_scales = list(_cfg_get(cfg, "TEST.TTA.SCALES", [0.875, 1.125]))
+    allow_scaled_tta = bool(getattr(model, "supports_scaled_inference", False))
+
+    if use_scales and not allow_scaled_tta:
+        if not getattr(predict_with_tta, "_warned_scale_skip", False):
+            print(
+                f"Skip TEST.TTA.SCALES={use_scales} because this ViT image encoder uses fixed positional embeddings "
+                f"and only supports the trained input size ({images.shape[-1]}x{images.shape[-2]}) without encoder changes."
+            )
+            predict_with_tta._warned_scale_skip = True
+        use_scales = []
 
     preds = []
     base_pred = _forward_predictive_mean(model, images, texts, num_samples)
@@ -99,8 +109,10 @@ def predict_with_tta(model, images, texts, cfg):
 
     h, w = images.shape[-2:]
     for scale in use_scales:
-        nh = _round_to_multiple(h * float(scale), 16)
-        nw = _round_to_multiple(w * float(scale), 16)
+        nh = _round_to_multiple(h * float(scale), 32)
+        nw = _round_to_multiple(w * float(scale), 32)
+        if (nh, nw) == (h, w):
+            continue
         scaled = F.interpolate(images, size=(nh, nw), mode="bilinear", align_corners=False)
         scaled_pred = _forward_predictive_mean(model, scaled, texts, num_samples)
         if scaled_pred.shape[-2:] != (h, w):
