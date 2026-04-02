@@ -118,7 +118,12 @@ def _largest_bbox(binary: np.ndarray):
     return x, y, w, h
 
 
-def crop_valid_fov(image: np.ndarray, mask: Optional[np.ndarray] = None, gray_thr: int = 8, min_keep_ratio: float = 0.55):
+def crop_valid_fov(image: np.ndarray, mask: Optional[np.ndarray] = None, gray_thr: int = 8, min_keep_ratio: float = 0.55, return_meta: bool = False):
+    orig_h, orig_w = int(image.shape[0]), int(image.shape[1])
+    crop_meta = {
+        'crop_xywh': np.array([0, 0, orig_w, orig_h], dtype=np.int32),
+        'crop_applied': np.array([0], dtype=np.int32),
+    }
     if image.ndim == 2:
         gray = image
     else:
@@ -129,17 +134,50 @@ def crop_valid_fov(image: np.ndarray, mask: Optional[np.ndarray] = None, gray_th
     valid = cv2.morphologyEx(valid, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     bbox = _largest_bbox(valid)
     if bbox is None:
-        return image, mask
+        return (image, mask, crop_meta) if return_meta else (image, mask)
 
     x, y, w, h = bbox
     keep_ratio = (w * h) / float(max(1, image.shape[0] * image.shape[1]))
     if keep_ratio < min_keep_ratio:
-        return image, mask
+        return (image, mask, crop_meta) if return_meta else (image, mask)
 
+    crop_meta['crop_xywh'] = np.array([x, y, w, h], dtype=np.int32)
+    crop_meta['crop_applied'] = np.array([1], dtype=np.int32)
     image = image[y:y + h, x:x + w]
     if mask is not None:
         mask = mask[y:y + h, x:x + w]
-    return image, mask
+    return (image, mask, crop_meta) if return_meta else (image, mask)
+
+
+def crop_dark_frame(image: np.ndarray, mask: Optional[np.ndarray] = None, gray_thr: int = 12, min_keep_ratio: float = 0.60, return_meta: bool = False):
+    orig_h, orig_w = int(image.shape[0]), int(image.shape[1])
+    crop_meta = {
+        'crop_xywh': np.array([0, 0, orig_w, orig_h], dtype=np.int32),
+        'crop_applied': np.array([0], dtype=np.int32),
+    }
+    if image.ndim == 2:
+        gray = image
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+    valid = (gray > gray_thr).astype(np.uint8)
+    valid = cv2.morphologyEx(valid, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    valid = cv2.morphologyEx(valid, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
+    bbox = _largest_bbox(valid)
+    if bbox is None:
+        return (image, mask, crop_meta) if return_meta else (image, mask)
+
+    x, y, w, h = bbox
+    keep_ratio = (w * h) / float(max(1, image.shape[0] * image.shape[1]))
+    if keep_ratio < min_keep_ratio:
+        return (image, mask, crop_meta) if return_meta else (image, mask)
+
+    crop_meta['crop_xywh'] = np.array([x, y, w, h], dtype=np.int32)
+    crop_meta['crop_applied'] = np.array([1], dtype=np.int32)
+    image = image[y:y + h, x:x + w]
+    if mask is not None:
+        mask = mask[y:y + h, x:x + w]
+    return (image, mask, crop_meta) if return_meta else (image, mask)
 
 
 def enhance_endo_luminance(image: np.ndarray) -> np.ndarray:
@@ -147,6 +185,26 @@ def enhance_endo_luminance(image: np.ndarray) -> np.ndarray:
     l, a, b = cv2.split(lab)
     l = percentile_clip(l, 1.0, 99.0)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge([l, a, b])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+
+def derm_color_constancy(image: np.ndarray, power: float = 6.0, eps: float = 1e-6) -> np.ndarray:
+    img = image.astype(np.float32) / 255.0
+    img = np.maximum(img, eps)
+    illum = np.power(np.mean(np.power(img, power), axis=(0, 1)), 1.0 / power)
+    illum = illum / max(np.linalg.norm(illum), eps)
+    illum = illum * np.sqrt(3.0)
+    img = img / illum.reshape(1, 1, 3)
+    img = img / max(np.percentile(img, 99.0), eps)
+    return np.clip(img * 255.0, 0, 255).astype(np.uint8)
+
+
+def enhance_derm_contrast(image: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=1.8, tileGridSize=(8, 8))
     l = clahe.apply(l)
     lab = cv2.merge([l, a, b])
     return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
@@ -172,6 +230,14 @@ def preprocess_image_by_modality(image: np.ndarray, modality: str, is_train: boo
             image = enhance_endo_luminance(image)
         return image.astype(np.uint8)
 
+    if modality == 'derm':
+        if bool(_pp_get(cfg, 'DERM_COLOR_CONSTANCY', True)):
+            image = derm_color_constancy(image, power=float(_pp_get(cfg, 'DERM_COLOR_CONSTANCY_POWER', 6.0)))
+        do_enhance = bool(_pp_get(cfg, 'DERM_ENHANCE_TRAIN', False)) if is_train else bool(_pp_get(cfg, 'DERM_ENHANCE_EVAL', False))
+        if do_enhance:
+            image = enhance_derm_contrast(image)
+        return image.astype(np.uint8)
+
     return image.astype(np.uint8)
 
 
@@ -190,11 +256,22 @@ def resize_image_and_mask(
     output_size: Sequence[int],
     keep_aspect_ratio: bool = False,
     pad_mode: str = 'edge',
+    return_meta: bool = False,
 ):
     target_h, target_w = int(output_size[0]), int(output_size[1])
+    orig_h, orig_w = int(image.shape[0]), int(image.shape[1])
+    meta = {
+        'orig_hw': np.array([orig_h, orig_w], dtype=np.int32),
+        'resized_hw': np.array([target_h, target_w], dtype=np.int32),
+        'pad_tblr': np.array([0, 0, 0, 0], dtype=np.int32),
+        'keep_aspect_ratio': np.array([1 if keep_aspect_ratio else 0], dtype=np.int32),
+    }
+
     if not keep_aspect_ratio:
         image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        if return_meta:
+            return image, mask, meta
         return image, mask
 
     h, w = image.shape[:2]
@@ -216,6 +293,11 @@ def resize_image_and_mask(
     border_type = _cv2_border_type(pad_mode)
     image = cv2.copyMakeBorder(image, pad_top, pad_bottom, pad_left, pad_right, border_type, value=0)
     mask = cv2.copyMakeBorder(mask, pad_top, pad_bottom, pad_left, pad_right, cv2.BORDER_CONSTANT, value=0)
+
+    meta['resized_hw'] = np.array([new_h, new_w], dtype=np.int32)
+    meta['pad_tblr'] = np.array([pad_top, pad_bottom, pad_left, pad_right], dtype=np.int32)
+    if return_meta:
+        return image, mask, meta
     return image, mask
 
 
@@ -327,6 +409,91 @@ def apply_random_endoscopic_viewport(image: np.ndarray, mask: np.ndarray, fov_ra
     return out, mask
 
 
+def apply_random_derm_frame(image: np.ndarray, mask: np.ndarray, border_ratio=(0.04, 0.18), pad_value=0):
+    h, w = image.shape[:2]
+    bw = int(round(random.uniform(border_ratio[0], border_ratio[1]) * min(h, w)))
+    bw = max(2, min(bw, min(h, w) // 4))
+    mode = random.choice(['all', 'tb', 'lr', 'corner'])
+    out = image.copy()
+    if mode in {'all', 'tb'}:
+        out[:bw, :] = pad_value
+        out[-bw:, :] = pad_value
+    if mode in {'all', 'lr'}:
+        out[:, :bw] = pad_value
+        out[:, -bw:] = pad_value
+    if mode == 'corner':
+        out[:bw, :] = pad_value
+        out[:, :bw] = pad_value
+    return out, mask
+
+
+def apply_random_derm_zoom_out(
+    image: np.ndarray,
+    mask: np.ndarray,
+    scale=(0.68, 0.92),
+    center_jitter: float = 0.10,
+    black_pad_p: float = 0.70,
+    pad_mode: str = 'edge',
+    pad_value: int = 0,
+):
+    # Shrink the lesion canvas and paste it back onto a same-size image.
+    # This simulates smaller lesions, more surrounding skin context, and
+    # occasional dark borders without changing the final tensor size.
+    h, w = image.shape[:2]
+    s = float(random.uniform(scale[0], scale[1]))
+    new_h = max(8, min(h, int(round(h * s))))
+    new_w = max(8, min(w, int(round(w * s))))
+
+    interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+    small_img = cv2.resize(image, (new_w, new_h), interpolation=interp)
+    small_mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+    if random.random() < black_pad_p:
+        canvas = np.full((h, w, image.shape[2]), pad_value, dtype=image.dtype)
+    else:
+        if str(pad_mode).lower() == 'reflect':
+            canvas = np.full((h, w, image.shape[2]), pad_value, dtype=image.dtype)
+        else:
+            mean_color = small_img.reshape(-1, small_img.shape[-1]).mean(axis=0).astype(image.dtype)
+            canvas = np.tile(mean_color.reshape(1, 1, -1), (h, w, 1))
+
+    canvas_mask = np.zeros((h, w), dtype=mask.dtype)
+
+    max_off_y = max(0, h - new_h)
+    max_off_x = max(0, w - new_w)
+    base_y = max_off_y // 2
+    base_x = max_off_x // 2
+    jitter_y = int(round(center_jitter * max_off_y))
+    jitter_x = int(round(center_jitter * max_off_x))
+    top = int(np.clip(base_y + (random.randint(-jitter_y, jitter_y) if jitter_y > 0 else 0), 0, max_off_y))
+    left = int(np.clip(base_x + (random.randint(-jitter_x, jitter_x) if jitter_x > 0 else 0), 0, max_off_x))
+
+    canvas[top:top + new_h, left:left + new_w] = small_img
+    canvas_mask[top:top + new_h, left:left + new_w] = small_mask
+    return canvas, canvas_mask
+
+
+def apply_random_hair_occlusion(image: np.ndarray, num_hairs=(3, 12), thickness=(1, 3), darkness=(5, 60)):
+    h, w = image.shape[:2]
+    out = image.copy()
+    n = random.randint(int(num_hairs[0]), int(num_hairs[1]))
+    for _ in range(n):
+        color = int(random.uniform(darkness[0], darkness[1]))
+        start = (random.randint(0, w - 1), random.randint(0, h - 1))
+        length = random.uniform(0.15, 0.55) * min(h, w)
+        angle = random.uniform(0, np.pi)
+        dx = int(np.cos(angle) * length)
+        dy = int(np.sin(angle) * length)
+        ctrl = (
+            int(np.clip(start[0] + dx * 0.5 + random.uniform(-0.12, 0.12) * w, 0, w - 1)),
+            int(np.clip(start[1] + dy * 0.5 + random.uniform(-0.12, 0.12) * h, 0, h - 1)),
+        )
+        end = (int(np.clip(start[0] + dx, 0, w - 1)), int(np.clip(start[1] + dy, 0, h - 1)))
+        curve = np.array([start, ctrl, end], dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(out, [curve], False, (color, color, color), thickness=random.randint(int(thickness[0]), int(thickness[1])), lineType=cv2.LINE_AA)
+    return out
+
+
 def apply_endo_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
     if random.random() < float(_aug_get(cfg, 'HFLIP_P', 0.5)):
         image = cv2.flip(image, 1)
@@ -385,6 +552,78 @@ def apply_endo_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
     return image, mask
 
 
+def apply_derm_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
+    if random.random() < float(_aug_get(cfg, 'HFLIP_P', 0.5)):
+        image = cv2.flip(image, 1)
+        mask = cv2.flip(mask, 1)
+    if random.random() < float(_aug_get(cfg, 'VFLIP_P', 0.25)):
+        image = cv2.flip(image, 0)
+        mask = cv2.flip(mask, 0)
+
+    if random.random() < float(_aug_get(cfg, 'DERM_ROTATE_P', 0.35)):
+        image, mask = rotate_pair(image, mask, float(_aug_get(cfg, 'DERM_ROTATE_DEG', 25.0)))
+
+    focus_p = float(_aug_get(cfg, 'DERM_FOCUS_CROP_P', 0.35))
+    if random.random() < focus_p:
+        scale = _aug_get(cfg, 'DERM_FOCUS_SCALE', [0.72, 1.0])
+        image, mask = random_focus_crop_pair(
+            image,
+            mask,
+            scale=(float(scale[0]), float(scale[1])),
+            min_fg_keep=float(_aug_get(cfg, 'DERM_MIN_FG_KEEP', 0.92)),
+        )
+
+    if random.random() < float(_aug_get(cfg, 'DERM_COLOR_P', 0.35)):
+        alpha = random.uniform(0.92, 1.10)
+        beta = random.uniform(-8.0, 8.0)
+        image = np.clip(image.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
+        hsv[..., 1] *= random.uniform(0.92, 1.15)
+        hsv[..., 0] += random.uniform(-4.0, 4.0)
+        hsv[..., 0] %= 180.0
+        hsv[..., 1:] = np.clip(hsv[..., 1:], 0, 255)
+        image = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+    if random.random() < float(_aug_get(cfg, 'DERM_GAMMA_P', 0.20)):
+        image = adjust_gamma(image, random.uniform(0.90, 1.12))
+
+    if random.random() < float(_aug_get(cfg, 'DERM_BLUR_P', 0.08)):
+        image = cv2.GaussianBlur(image, (3, 3), 0)
+
+    if random.random() < float(_aug_get(cfg, 'DERM_NOISE_P', 0.04)):
+        noise = np.random.normal(0.0, float(_aug_get(cfg, 'DERM_NOISE_STD', 2.0)), size=image.shape).astype(np.float32)
+        image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    if random.random() < float(_aug_get(cfg, 'DERM_HAIR_P', 0.20)):
+        image = apply_random_hair_occlusion(
+            image,
+            num_hairs=tuple(int(x) for x in _aug_get(cfg, 'DERM_HAIR_COUNT', [3, 10])),
+            thickness=tuple(int(x) for x in _aug_get(cfg, 'DERM_HAIR_THICKNESS', [1, 3])),
+            darkness=tuple(float(x) for x in _aug_get(cfg, 'DERM_HAIR_DARKNESS', [5, 55])),
+        )
+
+    if random.random() < float(_aug_get(cfg, 'DERM_FRAME_P', 0.12)):
+        image, mask = apply_random_derm_frame(
+            image,
+            mask,
+            border_ratio=tuple(float(x) for x in _aug_get(cfg, 'DERM_FRAME_RATIO', [0.04, 0.18])),
+            pad_value=int(_aug_get(cfg, 'DERM_FRAME_VALUE', 0)),
+        )
+
+    if random.random() < float(_aug_get(cfg, 'DERM_ZOOM_OUT_P', 0.0)):
+        image, mask = apply_random_derm_zoom_out(
+            image,
+            mask,
+            scale=tuple(float(x) for x in _aug_get(cfg, 'DERM_ZOOM_OUT_SCALE', [0.68, 0.92])),
+            center_jitter=float(_aug_get(cfg, 'DERM_ZOOM_OUT_CENTER_JITTER', 0.10)),
+            black_pad_p=float(_aug_get(cfg, 'DERM_ZOOM_OUT_BLACK_PAD_P', 0.70)),
+            pad_mode=str(_aug_get(cfg, 'DERM_ZOOM_OUT_PAD_MODE', 'edge')),
+            pad_value=int(_aug_get(cfg, 'DERM_FRAME_VALUE', 0)),
+        )
+
+    return image, mask
+
+
 def apply_default_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
     if random.random() < float(_aug_get(cfg, 'HFLIP_P', 0.5)):
         image = cv2.flip(image, 1)
@@ -408,21 +647,35 @@ class ValGenerator(object):
         if mask.ndim == 3:
             mask = mask[..., 0]
 
+        crop_meta = {
+            'crop_xywh': np.array([0, 0, int(image.shape[1]), int(image.shape[0])], dtype=np.int32),
+            'crop_applied': np.array([0], dtype=np.int32),
+        }
         if modality == 'endo' and bool(_pp_get(self.cfg, 'ENDO_CROP_VALID_FOV', False)):
-            image, mask = crop_valid_fov(
+            image, mask, crop_meta = crop_valid_fov(
                 image,
                 mask,
                 gray_thr=int(_pp_get(self.cfg, 'ENDO_CROP_GRAY_THR', 8)),
                 min_keep_ratio=float(_pp_get(self.cfg, 'ENDO_CROP_MIN_KEEP_RATIO', 0.55)),
+                return_meta=True,
+            )
+        if modality == 'derm' and bool(_pp_get(self.cfg, 'DERM_CROP_DARK_FRAME', False)):
+            image, mask, crop_meta = crop_dark_frame(
+                image,
+                mask,
+                gray_thr=int(_pp_get(self.cfg, 'DERM_CROP_GRAY_THR', 12)),
+                min_keep_ratio=float(_pp_get(self.cfg, 'DERM_CROP_MIN_KEEP_RATIO', 0.60)),
+                return_meta=True,
             )
 
         image = preprocess_image_by_modality(image, modality, is_train=False, cfg=self.cfg)
-        image, mask = resize_image_and_mask(
+        image, mask, resize_meta = resize_image_and_mask(
             image,
             mask,
             self.output_size,
-            keep_aspect_ratio=bool(_pp_get(self.cfg, 'KEEP_ASPECT_RATIO', modality == 'endo')),
+            keep_aspect_ratio=bool(_pp_get(self.cfg, 'KEEP_ASPECT_RATIO', modality in {'endo', 'derm'})),
             pad_mode=str(_pp_get(self.cfg, 'PAD_MODE', 'edge')),
+            return_meta=True,
         )
 
         image = Image.fromarray(image.astype(np.uint8))
@@ -433,6 +686,12 @@ class ValGenerator(object):
 
         sample['image'] = image
         sample['ground_truth_mask'] = mask
+        sample['meta_orig_hw'] = torch.as_tensor(resize_meta['orig_hw'], dtype=torch.int32)
+        sample['meta_resized_hw'] = torch.as_tensor(resize_meta['resized_hw'], dtype=torch.int32)
+        sample['meta_pad_tblr'] = torch.as_tensor(resize_meta['pad_tblr'], dtype=torch.int32)
+        sample['meta_keep_ar'] = torch.as_tensor(resize_meta['keep_aspect_ratio'], dtype=torch.int32)
+        sample['meta_crop_xywh'] = torch.as_tensor(crop_meta['crop_xywh'], dtype=torch.int32)
+        sample['meta_crop_applied'] = torch.as_tensor(crop_meta['crop_applied'], dtype=torch.int32)
         return sample
 
 
@@ -450,25 +709,41 @@ class RandomGenerator(object):
         if mask.ndim == 3:
             mask = mask[..., 0]
 
+        crop_meta = {
+            'crop_xywh': np.array([0, 0, int(image.shape[1]), int(image.shape[0])], dtype=np.int32),
+            'crop_applied': np.array([0], dtype=np.int32),
+        }
         if modality == 'endo' and bool(_pp_get(self.cfg, 'ENDO_CROP_VALID_FOV', False)):
-            image, mask = crop_valid_fov(
+            image, mask, crop_meta = crop_valid_fov(
                 image,
                 mask,
                 gray_thr=int(_pp_get(self.cfg, 'ENDO_CROP_GRAY_THR', 8)),
                 min_keep_ratio=float(_pp_get(self.cfg, 'ENDO_CROP_MIN_KEEP_RATIO', 0.55)),
+                return_meta=True,
+            )
+        if modality == 'derm' and bool(_pp_get(self.cfg, 'DERM_CROP_DARK_FRAME', False)):
+            image, mask, crop_meta = crop_dark_frame(
+                image,
+                mask,
+                gray_thr=int(_pp_get(self.cfg, 'DERM_CROP_GRAY_THR', 12)),
+                min_keep_ratio=float(_pp_get(self.cfg, 'DERM_CROP_MIN_KEEP_RATIO', 0.60)),
+                return_meta=True,
             )
 
         image = preprocess_image_by_modality(image, modality, is_train=True, cfg=self.cfg)
-        image, mask = resize_image_and_mask(
+        image, mask, resize_meta = resize_image_and_mask(
             image,
             mask,
             self.output_size,
-            keep_aspect_ratio=bool(_pp_get(self.cfg, 'KEEP_ASPECT_RATIO', modality == 'endo')),
+            keep_aspect_ratio=bool(_pp_get(self.cfg, 'KEEP_ASPECT_RATIO', modality in {'endo', 'derm'})),
             pad_mode=str(_pp_get(self.cfg, 'PAD_MODE', 'edge')),
+            return_meta=True,
         )
 
         if modality == 'endo':
             image, mask = apply_endo_aug(image, mask, cfg=self.cfg)
+        elif modality == 'derm':
+            image, mask = apply_derm_aug(image, mask, cfg=self.cfg)
         else:
             image, mask = apply_default_aug(image, mask, cfg=self.cfg)
 
@@ -480,6 +755,12 @@ class RandomGenerator(object):
 
         sample['image'] = image
         sample['ground_truth_mask'] = mask
+        sample['meta_orig_hw'] = torch.as_tensor(resize_meta['orig_hw'], dtype=torch.int32)
+        sample['meta_resized_hw'] = torch.as_tensor(resize_meta['resized_hw'], dtype=torch.int32)
+        sample['meta_pad_tblr'] = torch.as_tensor(resize_meta['pad_tblr'], dtype=torch.int32)
+        sample['meta_keep_ar'] = torch.as_tensor(resize_meta['keep_aspect_ratio'], dtype=torch.int32)
+        sample['meta_crop_xywh'] = torch.as_tensor(crop_meta['crop_xywh'], dtype=torch.int32)
+        sample['meta_crop_applied'] = torch.as_tensor(crop_meta['crop_applied'], dtype=torch.int32)
         return sample
 
 
@@ -501,9 +782,48 @@ class DatasetSegmentation(Dataset):
         self.one_hot_mask = one_hot_mask
         self.task_name = task_name
         self.cfg = cfg
-        self.data_pairs = [(row['Image'], row['Ground Truth'], row['Description']) for row in row_text]
+        self.data_pairs = self._build_pairs(row_text)
         self.data_pairs = sorted(self.data_pairs, key=lambda x: x[0])
         self.joint_transform = joint_transform if joint_transform is not None else (lambda x: x)
+
+    def _build_pairs(self, row_text):
+        pairs = []
+        for row in row_text:
+            image_name = row.get('Image') or row.get('image')
+            text = row.get('Description') or row.get('description') or ''
+            mask_name = row.get('Ground Truth') or row.get('Mask') or row.get('mask') or image_name
+            if image_name is None:
+                continue
+            pairs.append((image_name, mask_name, text))
+        return pairs
+
+    def _resolve_mask_path(self, mask_filename: str, image_filename: str):
+        candidates = []
+        if mask_filename:
+            candidates.append(mask_filename)
+        stem, ext = os.path.splitext(image_filename)
+        candidates.extend([
+            image_filename,
+            f'{stem}_Segmentation{ext or ".png"}',
+            f'{stem}_mask{ext or ".png"}',
+            f'{stem}.png',
+        ])
+
+        seen = set()
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            path = os.path.join(self.output_path, cand)
+            if os.path.exists(path):
+                return path, cand
+
+        prefix = os.path.splitext(mask_filename or image_filename)[0]
+        for fname in sorted(os.listdir(self.output_path)):
+            if os.path.splitext(fname)[0] == prefix or fname.startswith(prefix):
+                return os.path.join(self.output_path, fname), fname
+
+        raise FileNotFoundError(os.path.join(self.output_path, mask_filename or image_filename))
 
     def __len__(self):
         return len(self.data_pairs)
@@ -511,7 +831,7 @@ class DatasetSegmentation(Dataset):
     def __getitem__(self, idx):
         image_filename, mask_filename, text = self.data_pairs[idx]
         image_path = os.path.join(self.input_path, image_filename)
-        mask_path = os.path.join(self.output_path, mask_filename)
+        mask_path, resolved_mask_name = self._resolve_mask_path(mask_filename, image_filename)
 
         image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
         if image is None:
@@ -531,7 +851,7 @@ class DatasetSegmentation(Dataset):
             'image': image,
             'ground_truth_mask': mask,
             'image_name': image_filename,
-            'mask_name': mask_filename,
+            'mask_name': resolved_mask_name,
             'text_prompt': text,
             'dataset_name': self.task_name,
         }
