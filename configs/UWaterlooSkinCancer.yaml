@@ -1,14 +1,80 @@
 DATASET:
-  NAME: UWaterlooSkinCancer
-  TRAIN_PATH: ./data/UWaterlooSkinCancer/Train_Folder/
-  VAL_PATH: ./data/UWaterlooSkinCancer/Val_Folder/
-  TEST_PATH: ./data/UWaterlooSkinCancer/Test_Folder/
-  TEXT_PROMPT_PATH: ./data/UWaterlooSkinCancer/Prompts_Folder/
+  NAME: "UWaterlooSkinCancer"
+  TRAIN_PATH: "./data/UWaterlooSkinCancer/Train_Folder/"
+  VAL_PATH: "./data/UWaterlooSkinCancer/Val_Folder/"
+  TEST_PATH: "./data/UWaterlooSkinCancer/Test_Folder/"
+  TEXT_PROMPT_PATH: "./data/UWaterlooSkinCancer/Prompts_Folder/"
   SIZE: 224
-  
+  MODALITY: derm
+  MASK_THRESHOLD: 127
+  PREPROCESS:
+    KEEP_ASPECT_RATIO: True
+    PAD_MODE: "edge"
+    NORMALIZE: "imagenet_clip"
+    DERM_COLOR_CONSTANCY: True
+    DERM_COLOR_CONSTANCY_POWER: 6.0
+    DERM_ENHANCE_TRAIN: False
+    DERM_ENHANCE_EVAL: False
+    # Keep OFF by default for UWaterloo unless crop inverse is explicitly desired.
+    # This dataset has heavy dark borders, but naive cropping can shift the lesion canvas.
+    DERM_CROP_DARK_FRAME: False
+    DERM_CROP_GRAY_THR: 12
+    DERM_CROP_MIN_KEEP_RATIO: 0.60
+
+TRAIN:
+  AUX_WEIGHT: 0.25
+  AUX_WEIGHTS: [0.5, 0.3, 0.2]
+  BATCH_SIZE: 16
+  CE_WEIGHT: 0.5
+  CLIP_WEIGHT: 0.1
+  DICE_WEIGHT: 0.5
+  GATE_LR: 0.00010
+  GRAD_CLIP: 1.0
+  LEARNING_RATE: 0.0003
+  MIN_LR: 0.00001
+  NUM_EPOCHS: 100
+  NUM_WORKERS: 8
+  WEIGHT_DECAY: 0.0001
+  AUG:
+    HFLIP_P: 0.50
+    VFLIP_P: 0.25
+    DERM_ROTATE_P: 0.35
+    DERM_ROTATE_DEG: 25.0
+    DERM_FOCUS_CROP_P: 0.35
+    DERM_FOCUS_SCALE: [0.72, 1.0]
+    DERM_MIN_FG_KEEP: 0.92
+    DERM_COLOR_P: 0.35
+    DERM_GAMMA_P: 0.20
+    DERM_BLUR_P: 0.08
+    DERM_NOISE_P: 0.04
+    DERM_NOISE_STD: 2.0
+    DERM_HAIR_P: 0.20
+    DERM_HAIR_COUNT: [3, 10]
+    DERM_HAIR_THICKNESS: [1, 3]
+    DERM_HAIR_DARKNESS: [5, 55]
+    DERM_FRAME_P: 0.12
+    DERM_FRAME_RATIO: [0.04, 0.18]
+    DERM_FRAME_VALUE: 0
+
 TEST:
+  BATCH_SIZE: 16
   NUM_SAMPLES: 30
+  # UWaterloo has much heavier dark borders and much smaller lesions than ISIC.
+  # A slightly higher threshold and target-specific connected-component cleanup are safer
+  # than aggressive cropping or low thresholds.
+  THRESHOLD: 0.80
   USE_LATEST: True
+  TTA:
+    HFLIP: True
+    SCALES: []
+  POSTPROCESS:
+    ENABLE: True
+    KEEP_LARGEST: True
+    REMOVE_BORDER_COMPONENTS: True
+    BORDER_MARGIN: 8
+    MIN_AREA_RATIO: 0.0010
+    SCORE_BY_CENTER: True
+    CENTER_WEIGHT: 0.35
 
 MODEL:
   CLIP_MODEL: unimedclip
@@ -20,3 +86,12 @@ MODEL:
   LAYERS: [1,2,3,4,5,6,7,8,9,10]
   TEMPERATURE: 0.2
   DEVICE: "cuda"
+  ALLOW_POSITIONAL_INTERPOLATION: True
+  DECODER:
+    TYPE: "w_pvl_sr"
+    GLOBAL_LAYERS: [3,6,9,12]
+    GLOBAL_LAYERS_ONE_BASED: True
+    HYBRID_ALPHA_INIT: -1.4
+    HYBRID_FUSE: True
+    LOCAL_CHANNELS: [48,96,192,384]
+    RETURN_AUX: True
