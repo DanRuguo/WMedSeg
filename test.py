@@ -124,6 +124,132 @@ def predict_with_tta(model, images, texts, cfg):
     return torch.stack(preds, dim=0).mean(dim=0)
 
 
+def _to_hw_tensor(x, default=None):
+    if x is None:
+        return default
+    if isinstance(x, torch.Tensor):
+        return x
+    return torch.as_tensor(x)
+
+
+def _paste_back_crop(arr: np.ndarray, orig_hw, crop_xywh=None, crop_applied=False, is_binary=False):
+    arr = np.asarray(arr)
+    orig_h, orig_w = int(orig_hw[0]), int(orig_hw[1])
+    canvas = np.zeros((orig_h, orig_w), dtype=arr.dtype)
+    if crop_xywh is None or not crop_applied:
+        return arr
+    x, y, w, h = [int(v) for v in crop_xywh]
+    x = max(0, min(orig_w, x))
+    y = max(0, min(orig_h, y))
+    w = max(1, min(orig_w - x, w))
+    h = max(1, min(orig_h - y, h))
+    interp = cv2.INTER_NEAREST if is_binary else cv2.INTER_LINEAR
+    arr = cv2.resize(arr, (w, h), interpolation=interp)
+    canvas[y:y+h, x:x+w] = arr
+    if is_binary:
+        canvas = (canvas > 0).astype(np.uint8)
+    return canvas
+
+
+def _extract_components(mask: np.ndarray):
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    comps = []
+    for idx in range(1, num):
+        x, y, w, h, area = stats[idx]
+        cx, cy = centroids[idx]
+        comps.append({
+            'idx': idx,
+            'x': int(x), 'y': int(y), 'w': int(w), 'h': int(h),
+            'area': int(area), 'cx': float(cx), 'cy': float(cy),
+        })
+    return labels, comps
+
+
+def _postprocess_binary_mask(mask: np.ndarray, cfg):
+    if not bool(_cfg_get(cfg, 'TEST.POSTPROCESS.ENABLE', False)):
+        return mask.astype(np.uint8)
+
+    mask = (mask > 0).astype(np.uint8)
+    if mask.sum() == 0:
+        return mask
+
+    h, w = mask.shape[:2]
+    image_area = float(h * w)
+    labels, comps = _extract_components(mask)
+    if not comps:
+        return mask
+
+    min_area_ratio = float(_cfg_get(cfg, 'TEST.POSTPROCESS.MIN_AREA_RATIO', 0.0))
+    border_margin = int(_cfg_get(cfg, 'TEST.POSTPROCESS.BORDER_MARGIN', 0))
+    remove_border = bool(_cfg_get(cfg, 'TEST.POSTPROCESS.REMOVE_BORDER_COMPONENTS', False))
+    score_by_center = bool(_cfg_get(cfg, 'TEST.POSTPROCESS.SCORE_BY_CENTER', False))
+    center_weight = float(_cfg_get(cfg, 'TEST.POSTPROCESS.CENTER_WEIGHT', 0.35))
+    keep_largest = bool(_cfg_get(cfg, 'TEST.POSTPROCESS.KEEP_LARGEST', True))
+
+    kept = []
+    cx0, cy0 = 0.5 * w, 0.5 * h
+    max_dist = max((cx0 ** 2 + cy0 ** 2) ** 0.5, 1e-6)
+    for comp in comps:
+        if comp['area'] / image_area < min_area_ratio:
+            continue
+        touches_border = (
+            comp['x'] <= border_margin or comp['y'] <= border_margin or
+            (comp['x'] + comp['w']) >= (w - border_margin) or
+            (comp['y'] + comp['h']) >= (h - border_margin)
+        )
+        if remove_border and touches_border:
+            continue
+        score = float(comp['area'])
+        if score_by_center:
+            dist = ((comp['cx'] - cx0) ** 2 + (comp['cy'] - cy0) ** 2) ** 0.5 / max_dist
+            score = score * (1.0 + center_weight * (1.0 - dist))
+        comp['score'] = score
+        kept.append(comp)
+
+    if not kept:
+        return mask
+
+    out = np.zeros_like(mask, dtype=np.uint8)
+    if keep_largest:
+        best = max(kept, key=lambda c: c['score'])
+        out[labels == best['idx']] = 1
+    else:
+        for comp in kept:
+            out[labels == comp['idx']] = 1
+    return out
+
+
+def _restore_to_original_canvas(arr: np.ndarray, orig_hw, resized_hw=None, pad_tblr=None, keep_ar=False,
+                                crop_xywh=None, crop_applied=False, is_binary=False):
+    arr = np.asarray(arr)
+    orig_h, orig_w = int(orig_hw[0]), int(orig_hw[1])
+
+    target_h, target_w = orig_h, orig_w
+    if crop_applied and crop_xywh is not None:
+        target_w = max(1, int(crop_xywh[2]))
+        target_h = max(1, int(crop_xywh[3]))
+
+    if keep_ar and resized_hw is not None and pad_tblr is not None:
+        new_h, new_w = int(resized_hw[0]), int(resized_hw[1])
+        pad_top, pad_bottom, pad_left, pad_right = [int(x) for x in pad_tblr]
+        h, w = arr.shape[:2]
+        y0 = max(0, min(h, pad_top))
+        y1 = max(y0, min(h, h - pad_bottom))
+        x0 = max(0, min(w, pad_left))
+        x1 = max(x0, min(w, w - pad_right))
+        arr = arr[y0:y1, x0:x1]
+        if arr.size == 0:
+            arr = np.zeros((max(1, new_h), max(1, new_w)), dtype=np.float32 if not is_binary else np.uint8)
+
+    interp = cv2.INTER_NEAREST if is_binary else cv2.INTER_LINEAR
+    arr = cv2.resize(arr, (target_w, target_h), interpolation=interp)
+    if crop_applied and crop_xywh is not None:
+        arr = _paste_back_crop(arr, orig_hw=orig_hw, crop_xywh=crop_xywh, crop_applied=crop_applied, is_binary=is_binary)
+    elif is_binary:
+        arr = (arr > 0).astype(np.uint8)
+    return arr
+
+
 def main():
     cfg = get_arguments()
     if cfg.seed >= 0:
@@ -202,10 +328,46 @@ def main():
 
             dataset_names = batch["dataset_name"]
             mask_names = batch["mask_name"]
+            orig_hw = _to_hw_tensor(batch.get("meta_orig_hw"), None)
+            resized_hw = _to_hw_tensor(batch.get("meta_resized_hw"), None)
+            pad_tblr = _to_hw_tensor(batch.get("meta_pad_tblr"), None)
+            keep_ar = _to_hw_tensor(batch.get("meta_keep_ar"), None)
+            crop_xywh = _to_hw_tensor(batch.get("meta_crop_xywh"), None)
+            crop_applied = _to_hw_tensor(batch.get("meta_crop_applied"), None)
 
             for i in range(len(dataset_names)):
                 pred_mask = mask_preds[i].cpu().numpy().astype(np.uint8)
+                u_map = seg_unc[i].cpu().numpy()
                 mask_name = mask_names[i]
+
+                sample_orig_hw = orig_hw[i].tolist() if orig_hw is not None else [pred_mask.shape[0], pred_mask.shape[1]]
+                sample_resized_hw = resized_hw[i].tolist() if resized_hw is not None else [pred_mask.shape[0], pred_mask.shape[1]]
+                sample_pad_tblr = pad_tblr[i].tolist() if pad_tblr is not None else [0, 0, 0, 0]
+                sample_keep_ar = bool(int(keep_ar[i].item())) if keep_ar is not None else False
+                sample_crop_xywh = crop_xywh[i].tolist() if crop_xywh is not None else [0, 0, sample_orig_hw[1], sample_orig_hw[0]]
+                sample_crop_applied = bool(int(crop_applied[i].item())) if crop_applied is not None else False
+
+                pred_mask = _restore_to_original_canvas(
+                    pred_mask,
+                    orig_hw=sample_orig_hw,
+                    resized_hw=sample_resized_hw,
+                    pad_tblr=sample_pad_tblr,
+                    keep_ar=sample_keep_ar,
+                    crop_xywh=sample_crop_xywh,
+                    crop_applied=sample_crop_applied,
+                    is_binary=True,
+                )
+                pred_mask = _postprocess_binary_mask(pred_mask, cfg)
+                u_map = _restore_to_original_canvas(
+                    u_map,
+                    orig_hw=sample_orig_hw,
+                    resized_hw=sample_resized_hw,
+                    pad_tblr=sample_pad_tblr,
+                    keep_ar=sample_keep_ar,
+                    crop_xywh=sample_crop_xywh,
+                    crop_applied=sample_crop_applied,
+                    is_binary=False,
+                )
 
                 save_dir = os.path.join(
                     cfg.output_dir,
@@ -226,7 +388,6 @@ def main():
 
                 cv2.imwrite(os.path.join(save_dir, mask_name), pred_mask * 255)
 
-                u_map = seg_unc[i].cpu().numpy()
                 u_map = normalize(u_map)
                 colormap = plt.get_cmap("nipy_spectral")
                 u_map_color = (colormap(u_map)[:, :, :3] * 255).astype(np.uint8)

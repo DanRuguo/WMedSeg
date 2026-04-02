@@ -172,8 +172,8 @@ val_text_file = f"Val_text_{cfg.data_percentage}.xlsx" if cfg.data_percentage !=
 train_text = read_text(cfg.DATASET.TEXT_PROMPT_PATH + train_text_file)
 val_text = read_text(cfg.DATASET.TEXT_PROMPT_PATH + val_text_file)
 
-train_dataset = DatasetSegmentation(cfg.DATASET.TRAIN_PATH, cfg.DATASET.NAME, train_text, train_tf, image_size=cfg.DATASET.SIZE)
-val_dataset = DatasetSegmentation(cfg.DATASET.VAL_PATH, cfg.DATASET.NAME, val_text, val_tf, image_size=cfg.DATASET.SIZE)
+train_dataset = DatasetSegmentation(cfg.DATASET.TRAIN_PATH, cfg.DATASET.NAME, train_text, train_tf, image_size=cfg.DATASET.SIZE, cfg=cfg)
+val_dataset = DatasetSegmentation(cfg.DATASET.VAL_PATH, cfg.DATASET.NAME, val_text, val_tf, image_size=cfg.DATASET.SIZE, cfg=cfg)
 
 train_dataloader = DataLoader(
     train_dataset,
