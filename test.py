@@ -85,6 +85,8 @@ def _forward_predictive_mean(model, images, texts, num_samples):
 def predict_with_tta(model, images, texts, cfg):
     num_samples = int(_cfg_get(cfg, "TEST.NUM_SAMPLES", 8))
     use_hflip = bool(_cfg_get(cfg, "TEST.TTA.HFLIP", True))
+    use_vflip = bool(_cfg_get(cfg, "TEST.TTA.VFLIP", False))
+    rot90_list = list(_cfg_get(cfg, "TEST.TTA.ROT90", []))
     use_scales = list(_cfg_get(cfg, "TEST.TTA.SCALES", [0.875, 1.125]))
     allow_scaled_tta = bool(getattr(model, "supports_scaled_inference", False))
 
@@ -106,6 +108,21 @@ def predict_with_tta(model, images, texts, cfg):
         flip_pred = _forward_predictive_mean(model, flip_imgs, texts, num_samples)
         flip_pred = torch.flip(flip_pred, dims=[-1])
         preds.append(flip_pred)
+
+    if use_vflip:
+        flip_imgs = torch.flip(images, dims=[-2])
+        flip_pred = _forward_predictive_mean(model, flip_imgs, texts, num_samples)
+        flip_pred = torch.flip(flip_pred, dims=[-2])
+        preds.append(flip_pred)
+
+    for k in rot90_list:
+        k = int(k) % 4
+        if k == 0:
+            continue
+        rot_imgs = torch.rot90(images, k=k, dims=[-2, -1])
+        rot_pred = _forward_predictive_mean(model, rot_imgs, texts, num_samples)
+        rot_pred = torch.rot90(rot_pred, k=(4 - k) % 4, dims=[-2, -1])
+        preds.append(rot_pred)
 
     h, w = images.shape[-2:]
     for scale in use_scales:
@@ -165,6 +182,27 @@ def _extract_components(mask: np.ndarray):
     return labels, comps
 
 
+def _fill_holes_binary(mask: np.ndarray) -> np.ndarray:
+    mask = (mask > 0).astype(np.uint8)
+    if mask.sum() == 0:
+        return mask
+    h, w = mask.shape[:2]
+    flood = mask.copy()
+    ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    cv2.floodFill(flood, ff_mask, (0, 0), 1)
+    holes = (flood == 0).astype(np.uint8)
+    return np.clip(mask + holes, 0, 1).astype(np.uint8)
+
+
+def _smooth_probability_map(prob: np.ndarray, cfg) -> np.ndarray:
+    k = int(_cfg_get(cfg, 'TEST.POSTPROCESS.PROB_GAUSSIAN_K', 0))
+    if k <= 1:
+        return prob
+    if k % 2 == 0:
+        k += 1
+    return cv2.GaussianBlur(prob.astype(np.float32), (k, k), 0)
+
+
 def _postprocess_binary_mask(mask: np.ndarray, cfg):
     if not bool(_cfg_get(cfg, 'TEST.POSTPROCESS.ENABLE', False)):
         return mask.astype(np.uint8)
@@ -172,6 +210,16 @@ def _postprocess_binary_mask(mask: np.ndarray, cfg):
     mask = (mask > 0).astype(np.uint8)
     if mask.sum() == 0:
         return mask
+
+    k = int(_cfg_get(cfg, 'TEST.POSTPROCESS.MORPH_CLOSE_K', 0))
+    if k > 1:
+        if k % 2 == 0:
+            k += 1
+        kernel = np.ones((k, k), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    if bool(_cfg_get(cfg, 'TEST.POSTPROCESS.FILL_HOLES', False)):
+        mask = _fill_holes_binary(mask)
 
     h, w = mask.shape[:2]
     image_area = float(h * w)
@@ -319,12 +367,11 @@ def main():
             images = batch["image"].to(cfg.MODEL.DEVICE)
             texts = batch["text_prompt"]
 
-            seg_logits = predict_with_tta(model, images, texts, cfg)
+            seg_probs = predict_with_tta(model, images, texts, cfg)
             seg_unc = -(
-                seg_logits * torch.log(seg_logits + 1e-8) +
-                (1 - seg_logits) * torch.log(1 - seg_logits + 1e-8)
+                seg_probs * torch.log(seg_probs + 1e-8) +
+                (1 - seg_probs) * torch.log(1 - seg_probs + 1e-8)
             )
-            mask_preds = (seg_logits > threshold)
 
             dataset_names = batch["dataset_name"]
             mask_names = batch["mask_name"]
@@ -336,28 +383,31 @@ def main():
             crop_applied = _to_hw_tensor(batch.get("meta_crop_applied"), None)
 
             for i in range(len(dataset_names)):
-                pred_mask = mask_preds[i].cpu().numpy().astype(np.uint8)
+                prob_map = seg_probs[i].cpu().numpy().astype(np.float32)
                 u_map = seg_unc[i].cpu().numpy()
                 mask_name = mask_names[i]
 
-                sample_orig_hw = orig_hw[i].tolist() if orig_hw is not None else [pred_mask.shape[0], pred_mask.shape[1]]
-                sample_resized_hw = resized_hw[i].tolist() if resized_hw is not None else [pred_mask.shape[0], pred_mask.shape[1]]
+                sample_orig_hw = orig_hw[i].tolist() if orig_hw is not None else [prob_map.shape[0], prob_map.shape[1]]
+                sample_resized_hw = resized_hw[i].tolist() if resized_hw is not None else [prob_map.shape[0], prob_map.shape[1]]
                 sample_pad_tblr = pad_tblr[i].tolist() if pad_tblr is not None else [0, 0, 0, 0]
                 sample_keep_ar = bool(int(keep_ar[i].item())) if keep_ar is not None else False
                 sample_crop_xywh = crop_xywh[i].tolist() if crop_xywh is not None else [0, 0, sample_orig_hw[1], sample_orig_hw[0]]
                 sample_crop_applied = bool(int(crop_applied[i].item())) if crop_applied is not None else False
 
-                pred_mask = _restore_to_original_canvas(
-                    pred_mask,
+                prob_map = _restore_to_original_canvas(
+                    prob_map,
                     orig_hw=sample_orig_hw,
                     resized_hw=sample_resized_hw,
                     pad_tblr=sample_pad_tblr,
                     keep_ar=sample_keep_ar,
                     crop_xywh=sample_crop_xywh,
                     crop_applied=sample_crop_applied,
-                    is_binary=True,
+                    is_binary=False,
                 )
+                prob_map = _smooth_probability_map(prob_map, cfg)
+                pred_mask = (prob_map > threshold).astype(np.uint8)
                 pred_mask = _postprocess_binary_mask(pred_mask, cfg)
+
                 u_map = _restore_to_original_canvas(
                     u_map,
                     orig_hw=sample_orig_hw,
