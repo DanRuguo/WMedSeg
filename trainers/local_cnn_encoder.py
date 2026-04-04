@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 
 
 def make_gn(channels: int):
@@ -53,6 +52,38 @@ class DownsampleBlock(nn.Module):
         return self.block(x)
 
 
+class MixStyle(nn.Module):
+    """
+    Feature-statistics mixing for domain generalization.
+    Applied only during training and only on early CNN features so the local
+    branch does not overfit to source-domain scanner/style cues.
+    """
+    def __init__(self, p: float = 0.5, alpha: float = 0.3, eps: float = 1e-6):
+        super().__init__()
+        self.p = float(p)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
+        self.beta = torch.distributions.Beta(self.alpha, self.alpha)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (not self.training) or self.p <= 0 or x.size(0) <= 1:
+            return x
+        if torch.rand(1, device=x.device).item() >= self.p:
+            return x
+
+        B = x.size(0)
+        mu = x.mean(dim=(2, 3), keepdim=True)
+        var = x.var(dim=(2, 3), keepdim=True, unbiased=False)
+        sigma = (var + self.eps).sqrt()
+        x_norm = (x - mu) / sigma
+
+        perm = torch.randperm(B, device=x.device)
+        lmda = self.beta.sample((B, 1, 1, 1)).to(x.device, dtype=x.dtype)
+        mu_mix = lmda * mu + (1.0 - lmda) * mu[perm]
+        sigma_mix = lmda * sigma + (1.0 - lmda) * sigma[perm]
+        return x_norm * sigma_mix + mu_mix
+
+
 class LocalCNNEncoder(nn.Module):
     """
     Input:  [B, 3, 224, 224]
@@ -62,7 +93,8 @@ class LocalCNNEncoder(nn.Module):
         c3: [B, 256, 14, 14]
         c4: [B, 512,  7,  7]
     """
-    def __init__(self, in_channels=3, channels=(64, 128, 256, 512)):
+    def __init__(self, in_channels=3, channels=(64, 128, 256, 512), use_mixstyle: bool = False,
+                 mixstyle_p: float = 0.5, mixstyle_alpha: float = 0.3):
         super().__init__()
         c1, c2, c3, c4 = channels
 
@@ -95,11 +127,18 @@ class LocalCNNEncoder(nn.Module):
             ResidualDWBlock(c4),
         )
 
+        self.mixstyle = MixStyle(p=mixstyle_p, alpha=mixstyle_alpha) if use_mixstyle else nn.Identity()
+
     def forward(self, x):
         x = self.stem(x)
+        x = self.mixstyle(x)
 
         c1 = self.stage1(self.stage1_down(x))
+        c1 = self.mixstyle(c1)
+
         c2 = self.stage2(self.stage2_down(c1))
+        c2 = self.mixstyle(c2)
+
         c3 = self.stage3(self.stage3_down(c2))
         c4 = self.stage4(self.stage4_down(c3))
 

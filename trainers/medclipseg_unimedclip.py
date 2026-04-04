@@ -131,10 +131,18 @@ class CustomCLIP(nn.Module):
         self.global_pyramid = None
         self.w_decoder = None
 
+        self.local_mixstyle = getattr(decoder_cfg, "LOCAL_MIXSTYLE", True) if decoder_cfg is not None else True
+        self.local_mixstyle_p = getattr(decoder_cfg, "LOCAL_MIXSTYLE_P", 0.5) if decoder_cfg is not None else 0.5
+        self.local_mixstyle_alpha = getattr(decoder_cfg, "LOCAL_MIXSTYLE_ALPHA", 0.3) if decoder_cfg is not None else 0.3
+        self.local_drop_p = float(getattr(decoder_cfg, "LOCAL_DROP_P", 0.0)) if decoder_cfg is not None else 0.0
+
         if self.decoder_type in ("w_pvl", "w_pvl_sr"):
             self.local_encoder = LocalCNNEncoder(
                 in_channels=3,
                 channels=tuple(self.local_channels),
+                use_mixstyle=bool(self.local_mixstyle),
+                mixstyle_p=float(self.local_mixstyle_p),
+                mixstyle_alpha=float(self.local_mixstyle_alpha),
             )
             self.global_pyramid = GlobalPyramidBuilder(
                 clip_dim=self.embed_dim,
@@ -261,6 +269,9 @@ class CustomCLIP(nn.Module):
                 w_feats, aux_feats = dec_out, []
 
             w_feats = F.normalize(w_feats, dim=1)
+            if self.training and self.local_drop_p > 0:
+                drop_mask = (torch.rand(B, 1, 1, 1, device=w_feats.device) < self.local_drop_p).to(w_feats.dtype)
+                w_feats = F.normalize((1.0 - drop_mask) * w_feats + drop_mask * clip_feats, dim=1)
             if self.hybrid_fuse:
                 alpha = torch.sigmoid(self.hybrid_alpha)
                 seg_feats = alpha * w_feats + (1.0 - alpha) * clip_feats
