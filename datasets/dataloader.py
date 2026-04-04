@@ -220,9 +220,24 @@ def preprocess_image_by_modality(image: np.ndarray, modality: str, is_train: boo
         return image.astype(np.uint8)
 
     if modality == 'mri':
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        gray = percentile_clip(gray, 1.0, 99.0)
-        return np.stack([gray, gray, gray], axis=-1)
+        # Brain MRI should follow the official MedCLIPSeg pipeline by default:
+        # keep the already standardized 2D slice as-is, then apply only a light
+        # rotation before resizing. Optional percentile clipping is preserved as
+        # an explicit opt-in ablation rather than the default path.
+        use_official = bool(_pp_get(cfg, 'MRI_USE_OFFICIAL', _pp_get(cfg, 'MRI_FOLLOW_OFFICIAL_PIPELINE', True)))
+        if use_official:
+            return image.astype(np.uint8)
+
+        if bool(_pp_get(cfg, 'MRI_PERCENTILE_CLIP', False)):
+            if image.ndim == 2:
+                gray = image
+            elif image.ndim == 3 and image.shape[2] == 1:
+                gray = image[..., 0]
+            else:
+                gray = cv2.cvtColor(image[..., :3], cv2.COLOR_RGB2GRAY)
+            gray = percentile_clip(gray, 1.0, 99.0)
+            image = np.stack([gray, gray, gray], axis=-1)
+        return image.astype(np.uint8)
 
     if modality == 'endo':
         do_enhance = bool(_pp_get(cfg, 'ENDO_ENHANCE_TRAIN', False)) if is_train else bool(_pp_get(cfg, 'ENDO_ENHANCE_EVAL', False))
@@ -494,6 +509,78 @@ def apply_random_hair_occlusion(image: np.ndarray, num_hairs=(3, 12), thickness=
     return out
 
 
+def _sample_range(value, default_pair):
+    if value is None:
+        lo, hi = default_pair
+    elif isinstance(value, (list, tuple)) and len(value) >= 2:
+        lo, hi = float(value[0]), float(value[1])
+    else:
+        lo = hi = float(value)
+    if lo > hi:
+        lo, hi = hi, lo
+    return random.uniform(float(lo), float(hi))
+
+
+def apply_random_bias_field(image: np.ndarray, coeff_range=(0.10, 0.35), downsample=(24, 24), eps: float = 1e-6) -> np.ndarray:
+    h, w = image.shape[:2]
+    dh = max(2, min(h, int(downsample[0])))
+    dw = max(2, min(w, int(downsample[1])))
+    coeff = _sample_range(coeff_range, (0.10, 0.35))
+
+    coarse = np.random.normal(0.0, 1.0, size=(dh, dw)).astype(np.float32)
+    coarse = cv2.GaussianBlur(coarse, (0, 0), sigmaX=max(dw / 6.0, 1.0), sigmaY=max(dh / 6.0, 1.0))
+    field = cv2.resize(coarse, (w, h), interpolation=cv2.INTER_CUBIC)
+    field = field - float(field.mean())
+    field = field / max(float(field.std()), eps)
+    field = np.exp(coeff * field).astype(np.float32)
+
+    img = image.astype(np.float32)
+    if img.ndim == 2:
+        out = img * field
+    else:
+        out = img * field[..., None]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def apply_random_zoom_out_pair(
+    image: np.ndarray,
+    mask: np.ndarray,
+    scale=(0.80, 0.96),
+    center_jitter: float = 0.08,
+    pad_mode: str = 'edge',
+    pad_value: int = 0,
+):
+    h, w = image.shape[:2]
+    s = float(random.uniform(scale[0], scale[1]))
+    new_h = max(8, min(h, int(round(h * s))))
+    new_w = max(8, min(w, int(round(w * s))))
+
+    interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+    small_img = cv2.resize(image, (new_w, new_h), interpolation=interp)
+    small_mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+    if str(pad_mode).lower() == 'constant':
+        canvas = np.full((h, w, image.shape[2]), pad_value, dtype=image.dtype)
+    else:
+        mean_color = small_img.reshape(-1, small_img.shape[-1]).mean(axis=0).astype(image.dtype)
+        canvas = np.tile(mean_color.reshape(1, 1, -1), (h, w, 1))
+
+    canvas_mask = np.zeros((h, w), dtype=mask.dtype)
+
+    max_off_y = max(0, h - new_h)
+    max_off_x = max(0, w - new_w)
+    base_y = max_off_y // 2
+    base_x = max_off_x // 2
+    jitter_y = int(round(center_jitter * max_off_y))
+    jitter_x = int(round(center_jitter * max_off_x))
+    top = int(np.clip(base_y + (random.randint(-jitter_y, jitter_y) if jitter_y > 0 else 0), 0, max_off_y))
+    left = int(np.clip(base_x + (random.randint(-jitter_x, jitter_x) if jitter_x > 0 else 0), 0, max_off_x))
+
+    canvas[top:top + new_h, left:left + new_w] = small_img
+    canvas_mask[top:top + new_h, left:left + new_w] = small_mask
+    return canvas, canvas_mask
+
+
 def apply_endo_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
     if random.random() < float(_aug_get(cfg, 'HFLIP_P', 0.5)):
         image = cv2.flip(image, 1)
@@ -624,6 +711,72 @@ def apply_derm_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
     return image, mask
 
 
+
+def apply_mri_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
+    # Keep the official resize protocol lightweight while adding moderate MRI-
+    # specific domain randomization for better source->target robustness.
+    if random.random() < float(_aug_get(cfg, 'MRI_HFLIP_P', 0.0)):
+        image = cv2.flip(image, 1)
+        mask = cv2.flip(mask, 1)
+
+    if random.random() < float(_aug_get(cfg, 'MRI_ROTATE_P', 0.5)):
+        image, mask = rotate_pair(image, mask, float(_aug_get(cfg, 'MRI_ROTATE_DEG', 20.0)))
+
+    focus_p = float(_aug_get(cfg, 'MRI_FOCUS_CROP_P', 0.0))
+    if random.random() < focus_p:
+        scale = _aug_get(cfg, 'MRI_FOCUS_SCALE', [0.78, 1.0])
+        min_fg_keep = float(_aug_get(cfg, 'MRI_MIN_FG_KEEP', 0.88))
+        if mask.sum() > 0:
+            image, mask = random_focus_crop_pair(
+                image,
+                mask,
+                scale=(float(scale[0]), float(scale[1])),
+                min_fg_keep=min_fg_keep,
+            )
+        else:
+            image, mask = random_resized_crop_pair(
+                image,
+                mask,
+                scale=(float(scale[0]), float(scale[1])),
+            )
+
+    if random.random() < float(_aug_get(cfg, 'MRI_ZOOM_OUT_P', 0.0)):
+        image, mask = apply_random_zoom_out_pair(
+            image,
+            mask,
+            scale=tuple(float(x) for x in _aug_get(cfg, 'MRI_ZOOM_OUT_SCALE', [0.82, 0.96])),
+            center_jitter=float(_aug_get(cfg, 'MRI_ZOOM_OUT_CENTER_JITTER', 0.08)),
+            pad_mode=str(_pp_get(cfg, 'PAD_MODE', 'edge')),
+            pad_value=int(_aug_get(cfg, 'MRI_ZOOM_OUT_PAD_VALUE', 0)),
+        )
+
+    if random.random() < float(_aug_get(cfg, 'MRI_CONTRAST_P', 0.0)):
+        alpha = _sample_range(_aug_get(cfg, 'MRI_CONTRAST_RANGE', [0.90, 1.12]), (0.90, 1.12))
+        beta = _sample_range(_aug_get(cfg, 'MRI_BRIGHTNESS_RANGE', [-10.0, 10.0]), (-10.0, 10.0))
+        image = np.clip(image.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+
+    if random.random() < float(_aug_get(cfg, 'MRI_GAMMA_P', 0.0)):
+        gamma = _sample_range(_aug_get(cfg, 'MRI_GAMMA_RANGE', [0.88, 1.14]), (0.88, 1.14))
+        image = adjust_gamma(image, gamma)
+
+    if random.random() < float(_aug_get(cfg, 'MRI_BIAS_FIELD_P', 0.0)):
+        image = apply_random_bias_field(
+            image,
+            coeff_range=tuple(float(x) for x in _aug_get(cfg, 'MRI_BIAS_FIELD_COEFF', [0.10, 0.35])),
+            downsample=tuple(int(x) for x in _aug_get(cfg, 'MRI_BIAS_FIELD_DOWNSAMPLE', [24, 24])),
+        )
+
+    if random.random() < float(_aug_get(cfg, 'MRI_NOISE_P', 0.0)):
+        noise_std = float(_aug_get(cfg, 'MRI_NOISE_STD', 3.0))
+        noise = np.random.normal(0.0, noise_std, size=image.shape).astype(np.float32)
+        image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    if random.random() < float(_aug_get(cfg, 'MRI_BLUR_P', 0.0)):
+        image = cv2.GaussianBlur(image, (3, 3), 0)
+
+    return image, mask
+
+
 def apply_default_aug(image: np.ndarray, mask: np.ndarray, cfg=None):
     if random.random() < float(_aug_get(cfg, 'HFLIP_P', 0.5)):
         image = cv2.flip(image, 1)
@@ -665,6 +818,14 @@ class ValGenerator(object):
                 mask,
                 gray_thr=int(_pp_get(self.cfg, 'DERM_CROP_GRAY_THR', 12)),
                 min_keep_ratio=float(_pp_get(self.cfg, 'DERM_CROP_MIN_KEEP_RATIO', 0.60)),
+                return_meta=True,
+            )
+        if modality == 'mri' and bool(_pp_get(self.cfg, 'MRI_CROP_FOREGROUND', False)):
+            image, mask, crop_meta = crop_valid_fov(
+                image,
+                mask,
+                gray_thr=int(_pp_get(self.cfg, 'MRI_CROP_GRAY_THR', 4)),
+                min_keep_ratio=float(_pp_get(self.cfg, 'MRI_CROP_MIN_KEEP_RATIO', 0.70)),
                 return_meta=True,
             )
 
@@ -729,23 +890,43 @@ class RandomGenerator(object):
                 min_keep_ratio=float(_pp_get(self.cfg, 'DERM_CROP_MIN_KEEP_RATIO', 0.60)),
                 return_meta=True,
             )
+        if modality == 'mri' and bool(_pp_get(self.cfg, 'MRI_CROP_FOREGROUND', False)):
+            image, mask, crop_meta = crop_valid_fov(
+                image,
+                mask,
+                gray_thr=int(_pp_get(self.cfg, 'MRI_CROP_GRAY_THR', 4)),
+                min_keep_ratio=float(_pp_get(self.cfg, 'MRI_CROP_MIN_KEEP_RATIO', 0.70)),
+                return_meta=True,
+            )
 
         image = preprocess_image_by_modality(image, modality, is_train=True, cfg=self.cfg)
-        image, mask, resize_meta = resize_image_and_mask(
-            image,
-            mask,
-            self.output_size,
-            keep_aspect_ratio=bool(_pp_get(self.cfg, 'KEEP_ASPECT_RATIO', modality in {'endo', 'derm'})),
-            pad_mode=str(_pp_get(self.cfg, 'PAD_MODE', 'edge')),
-            return_meta=True,
-        )
 
-        if modality == 'endo':
-            image, mask = apply_endo_aug(image, mask, cfg=self.cfg)
-        elif modality == 'derm':
-            image, mask = apply_derm_aug(image, mask, cfg=self.cfg)
+        if modality == 'mri' and bool(_pp_get(self.cfg, 'MRI_USE_OFFICIAL', _pp_get(self.cfg, 'MRI_FOLLOW_OFFICIAL_PIPELINE', True))):
+            image, mask = apply_mri_aug(image, mask, cfg=self.cfg)
+            image, mask, resize_meta = resize_image_and_mask(
+                image,
+                mask,
+                self.output_size,
+                keep_aspect_ratio=bool(_pp_get(self.cfg, 'KEEP_ASPECT_RATIO', False)),
+                pad_mode=str(_pp_get(self.cfg, 'PAD_MODE', 'edge')),
+                return_meta=True,
+            )
         else:
-            image, mask = apply_default_aug(image, mask, cfg=self.cfg)
+            image, mask, resize_meta = resize_image_and_mask(
+                image,
+                mask,
+                self.output_size,
+                keep_aspect_ratio=bool(_pp_get(self.cfg, 'KEEP_ASPECT_RATIO', modality in {'endo', 'derm'})),
+                pad_mode=str(_pp_get(self.cfg, 'PAD_MODE', 'edge')),
+                return_meta=True,
+            )
+
+            if modality == 'endo':
+                image, mask = apply_endo_aug(image, mask, cfg=self.cfg)
+            elif modality == 'derm':
+                image, mask = apply_derm_aug(image, mask, cfg=self.cfg)
+            else:
+                image, mask = apply_default_aug(image, mask, cfg=self.cfg)
 
         image = Image.fromarray(image.astype(np.uint8))
         mask = Image.fromarray(mask.astype(np.uint8))
@@ -784,6 +965,12 @@ class DatasetSegmentation(Dataset):
         self.cfg = cfg
         self.data_pairs = self._build_pairs(row_text)
         self.data_pairs = sorted(self.data_pairs, key=lambda x: x[0])
+
+        modality = infer_modality(task_name, cfg)
+        if modality == 'mri' and self._is_train_split():
+            self.data_pairs = self._filter_mri_empty_pairs(self.data_pairs)
+            self.data_pairs = self._rebalance_mri_positive_pairs(self.data_pairs)
+
         self.joint_transform = joint_transform if joint_transform is not None else (lambda x: x)
 
     def _build_pairs(self, row_text):
@@ -796,6 +983,58 @@ class DatasetSegmentation(Dataset):
                 continue
             pairs.append((image_name, mask_name, text))
         return pairs
+
+    def _is_train_split(self) -> bool:
+        split_name = os.path.basename(os.path.normpath(self.dataset_path)).lower()
+        return split_name.startswith('train_folder')
+
+    def _filter_mri_empty_pairs(self, pairs):
+        keep_prob = float(_cfg_get(self.cfg, 'TRAIN.MRI_EMPTY_KEEP_PROB', 1.0))
+        if keep_prob >= 0.999:
+            return pairs
+
+        filtered = []
+        threshold = int(_cfg_get(self.cfg, 'DATASET.MASK_THRESHOLD', 127))
+        for image_name, mask_name, text in pairs:
+            try:
+                mask_path, _ = self._resolve_mask_path(mask_name, image_name)
+                mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+                if mask is None:
+                    continue
+                mask = binarize_mask(mask, threshold=threshold)
+                if mask.sum() == 0:
+                    if random.random() < keep_prob:
+                        filtered.append((image_name, mask_name, text))
+                else:
+                    filtered.append((image_name, mask_name, text))
+            except FileNotFoundError:
+                continue
+
+        return filtered if len(filtered) > 0 else pairs
+
+    def _rebalance_mri_positive_pairs(self, pairs):
+        repeat = int(_cfg_get(self.cfg, 'TRAIN.MRI_POSITIVE_REPEAT', 1))
+        if repeat <= 1:
+            return pairs
+
+        threshold = int(_cfg_get(self.cfg, 'DATASET.MASK_THRESHOLD', 127))
+        balanced = []
+        for image_name, mask_name, text in pairs:
+            is_positive = False
+            try:
+                mask_path, _ = self._resolve_mask_path(mask_name, image_name)
+                mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+                if mask is not None:
+                    mask = binarize_mask(mask, threshold=threshold)
+                    is_positive = bool(mask.sum() > 0)
+            except FileNotFoundError:
+                is_positive = False
+
+            copies = repeat if is_positive else 1
+            for _ in range(max(1, copies)):
+                balanced.append((image_name, mask_name, text))
+
+        return balanced
 
     def _resolve_mask_path(self, mask_filename: str, image_filename: str):
         candidates = []
@@ -833,7 +1072,11 @@ class DatasetSegmentation(Dataset):
         image_path = os.path.join(self.input_path, image_filename)
         mask_path, resolved_mask_name = self._resolve_mask_path(mask_filename, image_filename)
 
-        image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        modality = infer_modality(self.task_name, self.cfg)
+        if modality == 'mri' and bool(_pp_get(self.cfg, 'MRI_USE_COLOR_IO', True)):
+            image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        else:
+            image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
         if image is None:
             raise FileNotFoundError(image_path)
         if image.ndim == 3:
